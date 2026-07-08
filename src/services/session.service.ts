@@ -14,6 +14,73 @@ const DEFAULT_WALLET_BALANCE = 1240.5;
 const HISTORY_STATUSES: SessionStatus[] = ['settled', 'revoked', 'expired'];
 const OPEN_STATUSES: SessionStatus[] = ['active', 'paused'];
 
+export const CREATE_SESSION_POLICY = {
+  minLimit: 0.05,
+  maxLimit: 500,
+  currency: 'USDC',
+  minExpiryMinutes: 5,
+  maxExpiryDays: 30,
+  platformFeeBps: 50,
+  minPlatformFee: 0.01,
+  estimatedNetworkFee: 0.001
+} as const;
+
+export interface VerifiedAppDto {
+  id: string;
+  name: string;
+  serviceAddress: string;
+  url: string;
+  category: string;
+  trustLevel: 'verified' | 'reviewed' | 'manual';
+  description: string;
+  defaultCharge: number;
+  chargePolicy: string;
+  iconType: IconType;
+  permissions: string[];
+}
+
+const VERIFIED_APP_CATALOG: VerifiedAppDto[] = [
+  {
+    id: 'fiber-ai-demo',
+    name: 'Fiber AI Demo',
+    serviceAddress: '0xA17a00000000000000000000000000000000F1b3',
+    url: 'https://demo.fiberpass.app/ai',
+    category: 'AI/API',
+    trustLevel: 'verified',
+    description: 'Reference AI/API app for per-request Fiber micropayments.',
+    defaultCharge: 0.02,
+    chargePolicy: '$0.02 per completed request',
+    iconType: 'ai',
+    permissions: ['Charge approved requests', 'Read pass status', 'Receive revoke events']
+  },
+  {
+    id: 'fiber-rpc-relay',
+    name: 'Fiber RPC Relay',
+    serviceAddress: '0xA17a00000000000000000000000000000000c0de',
+    url: 'https://relay.fiberpass.app',
+    category: 'RPC',
+    trustLevel: 'reviewed',
+    description: 'RPC relay app for small metered node calls.',
+    defaultCharge: 0.005,
+    chargePolicy: '$0.005 per RPC call',
+    iconType: 'rpc',
+    permissions: ['Charge API calls', 'Read remaining balance']
+  },
+  {
+    id: 'fiber-storage-demo',
+    name: 'Fiber Storage Demo',
+    serviceAddress: '0xA17a00000000000000000000000000000000dB01',
+    url: 'https://storage.fiberpass.app',
+    category: 'Storage',
+    trustLevel: 'reviewed',
+    description: 'Metered storage demo for bandwidth and object reads.',
+    defaultCharge: 0.01,
+    chargePolicy: '$0.01 per storage operation',
+    iconType: 'database',
+    permissions: ['Charge storage operations', 'Read pass status']
+  }
+];
+
 interface TransactionLogDto {
   id: string;
   type: string;
@@ -26,6 +93,14 @@ interface SessionLike {
   publicId: string;
   name: string;
   serviceAddress: string;
+  appId?: string;
+  appUrl?: string;
+  appTrustLevel?: string;
+  appPermissions?: string[];
+  chargePolicy?: string;
+  expiryAt?: Date;
+  platformFeeEstimate?: number;
+  networkFeeEstimate?: number;
   spent: number;
   limit: number;
   currency: string;
@@ -44,6 +119,14 @@ export interface SessionDto {
   id: string;
   name: string;
   serviceAddress: string;
+  appId?: string;
+  appUrl?: string;
+  appTrustLevel?: string;
+  appPermissions?: string[];
+  chargePolicy?: string;
+  expiryAt?: string;
+  platformFeeEstimate?: number;
+  networkFeeEstimate?: number;
   spent: number;
   limit: number;
   currency: string;
@@ -73,6 +156,14 @@ export interface SessionsOverviewDto {
 export interface CreateSessionInput {
   name: string;
   serviceAddress: string;
+  appId?: string;
+  appUrl?: string;
+  appTrustLevel?: string;
+  appPermissions?: string[];
+  chargePolicy?: string;
+  expiryAt?: string;
+  platformFeeEstimate?: number;
+  networkFeeEstimate?: number;
   limit: number;
   currency: string;
   duration: string;
@@ -86,6 +177,24 @@ export interface ChargeSessionInput {
   sessionId: string;
   amount: number;
   type: string;
+}
+
+export interface CreateSessionPolicyDto {
+  limits: {
+    min: number;
+    max: number;
+    currency: string;
+  };
+  expiry: {
+    minMinutes: number;
+    maxDays: number;
+  };
+  fees: {
+    platformFeeBps: number;
+    minPlatformFee: number;
+    estimatedNetworkFee: number;
+  };
+  verifiedApps: VerifiedAppDto[];
 }
 
 export interface WalletIdentity {
@@ -120,6 +229,14 @@ function toSessionDto(session: SessionLike): SessionDto {
     id: session.publicId,
     name: session.name,
     serviceAddress: session.serviceAddress,
+    appId: session.appId,
+    appUrl: session.appUrl,
+    appTrustLevel: session.appTrustLevel,
+    appPermissions: session.appPermissions ?? [],
+    chargePolicy: session.chargePolicy,
+    expiryAt: session.expiryAt instanceof Date ? session.expiryAt.toISOString() : session.expiryAt,
+    platformFeeEstimate: roundMoney(session.platformFeeEstimate ?? 0),
+    networkFeeEstimate: roundMoney(session.networkFeeEstimate ?? 0),
     spent: roundMoney(session.spent),
     limit: roundMoney(session.limit),
     currency: session.currency,
@@ -153,6 +270,66 @@ function seedForWallet(walletId: string, useFixedIds = false): Array<Record<stri
     ownerWalletId: walletId,
     publicId: useFixedIds ? session.publicId : newPublicId()
   }));
+}
+
+export function getCreateSessionPolicy(): CreateSessionPolicyDto {
+  return {
+    limits: {
+      min: CREATE_SESSION_POLICY.minLimit,
+      max: CREATE_SESSION_POLICY.maxLimit,
+      currency: CREATE_SESSION_POLICY.currency
+    },
+    expiry: {
+      minMinutes: CREATE_SESSION_POLICY.minExpiryMinutes,
+      maxDays: CREATE_SESSION_POLICY.maxExpiryDays
+    },
+    fees: {
+      platformFeeBps: CREATE_SESSION_POLICY.platformFeeBps,
+      minPlatformFee: CREATE_SESSION_POLICY.minPlatformFee,
+      estimatedNetworkFee: CREATE_SESSION_POLICY.estimatedNetworkFee
+    },
+    verifiedApps: VERIFIED_APP_CATALOG
+  };
+}
+
+function getVerifiedApp(appId?: string): VerifiedAppDto | undefined {
+  if (!appId || appId === 'manual') return undefined;
+  return VERIFIED_APP_CATALOG.find((app) => app.id === appId);
+}
+
+function validateCreateLimit(limit: number): void {
+  if (limit < CREATE_SESSION_POLICY.minLimit || limit > CREATE_SESSION_POLICY.maxLimit) {
+    throw new ApiError(
+      400,
+      'SESSION_LIMIT_OUT_OF_RANGE',
+      'FiberPass limit must be between $' + CREATE_SESSION_POLICY.minLimit.toFixed(2) + ' and $' + CREATE_SESSION_POLICY.maxLimit.toFixed(2) + '.'
+    );
+  }
+}
+
+function validateExpiryAt(expiryAt?: string): Date | undefined {
+  if (!expiryAt) return undefined;
+
+  const parsed = new Date(expiryAt);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new ApiError(400, 'INVALID_EXPIRY_TIME', 'Expiry time must be a valid ISO date.');
+  }
+
+  const minExpiry = Date.now() + CREATE_SESSION_POLICY.minExpiryMinutes * 60 * 1000;
+  const maxExpiry = Date.now() + CREATE_SESSION_POLICY.maxExpiryDays * 24 * 60 * 60 * 1000;
+  if (parsed.getTime() < minExpiry || parsed.getTime() > maxExpiry) {
+    throw new ApiError(
+      400,
+      'EXPIRY_OUT_OF_RANGE',
+      'Expiry must be at least ' + CREATE_SESSION_POLICY.minExpiryMinutes + ' minutes from now and no more than ' + CREATE_SESSION_POLICY.maxExpiryDays + ' days out.'
+    );
+  }
+
+  return parsed;
+}
+
+function estimatePlatformFee(limit: number): number {
+  return roundMoney(Math.max(CREATE_SESSION_POLICY.minPlatformFee, limit * (CREATE_SESSION_POLICY.platformFeeBps / 10000)));
 }
 
 export function walletIdFromAddress(address: string): string {
@@ -245,6 +422,23 @@ export async function getSessionsOverview(walletId: string): Promise<SessionsOve
 
 export async function createSession(input: CreateSessionInput, walletId: string): Promise<SessionsOverviewDto> {
   const limit = roundMoney(input.limit);
+  validateCreateLimit(limit);
+
+  if (input.currency !== CREATE_SESSION_POLICY.currency) {
+    throw new ApiError(400, 'UNSUPPORTED_CURRENCY', 'FiberPass currently supports ' + CREATE_SESSION_POLICY.currency + ' sessions.');
+  }
+
+  const verifiedApp = getVerifiedApp(input.appId);
+  if (input.appId && input.appId !== 'manual' && !verifiedApp) {
+    throw new ApiError(400, 'APP_NOT_VERIFIED', 'Selected app is not available for FiberPass sessions.');
+  }
+
+  const expiryAt = validateExpiryAt(input.expiryAt);
+  const serviceAddress = verifiedApp?.serviceAddress ?? input.serviceAddress;
+  const appPermissions = verifiedApp?.permissions ?? input.appPermissions ?? [];
+  const platformFeeEstimate = estimatePlatformFee(limit);
+  const networkFeeEstimate = CREATE_SESSION_POLICY.estimatedNetworkFee;
+
   const wallet = await WalletModel.findOneAndUpdate(
     { walletId, balance: { $gte: limit } },
     { $inc: { balance: -limit } },
@@ -259,15 +453,23 @@ export async function createSession(input: CreateSessionInput, walletId: string)
     await SessionModel.create({
       ownerWalletId: walletId,
       publicId: newPublicId(),
-      name: input.name,
-      serviceAddress: input.serviceAddress,
+      name: verifiedApp?.name ?? input.name,
+      serviceAddress,
+      appId: verifiedApp?.id ?? input.appId,
+      appUrl: verifiedApp?.url ?? input.appUrl,
+      appTrustLevel: verifiedApp?.trustLevel ?? input.appTrustLevel,
+      appPermissions,
+      chargePolicy: verifiedApp?.chargePolicy ?? input.chargePolicy,
+      expiryAt,
+      platformFeeEstimate,
+      networkFeeEstimate,
       spent: 0,
       limit,
       currency: input.currency,
       duration: input.duration,
       status: 'active',
-      iconType: input.iconType,
-      expiryTime: input.expiryTime,
+      iconType: verifiedApp?.iconType ?? input.iconType,
+      expiryTime: expiryAt ? expiryAt.toISOString() : input.expiryTime,
       autoMicroCharges: input.autoMicroCharges,
       singleUse: input.singleUse,
       logs: [newLog('Session Stream Limit Created')]

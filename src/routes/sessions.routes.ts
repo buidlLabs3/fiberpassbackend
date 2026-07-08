@@ -5,7 +5,9 @@ import { asyncHandler } from '../lib/asyncHandler.js';
 import { liveEvents } from '../lib/liveEvents.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
 import {
+  CREATE_SESSION_POLICY,
   createSession,
+  getCreateSessionPolicy,
   getSessionsOverview,
   isValidIconType,
   resetDemoData,
@@ -19,10 +21,18 @@ import type { AuthenticatedRequest } from '../types/auth.js';
 const createSessionSchema = z.object({
   name: z.string().trim().min(1).max(80),
   serviceAddress: z.string().trim().min(3).max(120),
-  limit: z.coerce.number().positive().max(100000),
-  currency: z.string().trim().min(2).max(12).default('USDC'),
+  appId: z.string().trim().min(1).max(80).optional(),
+  appUrl: z.string().trim().url().max(200).optional(),
+  appTrustLevel: z.string().trim().min(1).max(40).optional(),
+  appPermissions: z.array(z.string().trim().min(1).max(80)).max(12).optional(),
+  chargePolicy: z.string().trim().min(1).max(160).optional(),
+  expiryAt: z.string().datetime().optional(),
+  platformFeeEstimate: z.coerce.number().min(0).max(100000).optional(),
+  networkFeeEstimate: z.coerce.number().min(0).max(100000).optional(),
+  limit: z.coerce.number().min(CREATE_SESSION_POLICY.minLimit).max(CREATE_SESSION_POLICY.maxLimit),
+  currency: z.literal(CREATE_SESSION_POLICY.currency).default(CREATE_SESSION_POLICY.currency),
   duration: z.string().trim().min(1).max(40),
-  expiryTime: z.string().trim().min(1).max(80),
+  expiryTime: z.string().trim().min(1).max(120),
   autoMicroCharges: z.coerce.boolean().default(true),
   singleUse: z.coerce.boolean().default(false),
   iconType: z.string().refine(isValidIconType, 'Invalid icon type')
@@ -35,6 +45,10 @@ const topUpSchema = z.object({
 const paramsSchema = z.object({ id: z.string().min(1) });
 
 export const sessionsRouter = Router();
+
+sessionsRouter.get('/sessions/create-policy', requireAuth, asyncHandler(async (_request, response) => {
+  response.json(getCreateSessionPolicy());
+}));
 
 sessionsRouter.get('/sessions', requireAuth, asyncHandler(async (request, response) => {
   const { walletId } = (request as AuthenticatedRequest).auth;
@@ -67,6 +81,12 @@ sessionsRouter.post('/sessions/:id/revoke', requireAuth, asyncHandler(async (req
 }));
 
 sessionsRouter.post('/sessions/:id/settle', requireAuth, asyncHandler(async (request, response) => {
+  const { walletId } = (request as AuthenticatedRequest).auth;
+  const { id } = paramsSchema.parse(request.params);
+  response.json(await settleSession(id, walletId));
+}));
+
+sessionsRouter.post('/sessions/:id/close', requireAuth, asyncHandler(async (request, response) => {
   const { walletId } = (request as AuthenticatedRequest).auth;
   const { id } = paramsSchema.parse(request.params);
   response.json(await settleSession(id, walletId));
