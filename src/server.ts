@@ -12,6 +12,7 @@ import { securityHeaders } from './middleware/securityHeaders.middleware.js';
 import { appsRouter } from './routes/apps.routes.js';
 import { authRouter } from './routes/auth.routes.js';
 import { sessionsRouter } from './routes/sessions.routes.js';
+import { walletRouter } from './routes/wallet.routes.js';
 
 function parseCorsOrigin(origin: string): boolean | string[] {
   if (origin === '*') return true;
@@ -53,9 +54,11 @@ app.get('/health', (_request, response) => {
 app.use(authRouter);
 app.use(appsRouter);
 app.use(sessionsRouter);
+app.use(walletRouter);
 app.use('/v1', authRouter);
 app.use('/v1', appsRouter);
 app.use('/v1', sessionsRouter);
+app.use('/v1', walletRouter);
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
   if (error instanceof ZodError) {
     response.status(400).json({

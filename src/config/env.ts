@@ -21,6 +21,7 @@ const envSchema = z.object({
   FIBER_RPC_URL: z.string().min(1).default('http://127.0.0.1:8227'),
   FIBER_API_KEY: z.string().optional().default(''),
   FIBER_PEER_ID: z.string().optional().default(''),
+  FIBERPASS_TREASURY_ADDRESS: z.string().optional().default(''),
   REQUEST_BODY_LIMIT: z.string().default('128kb'),
   TRUST_PROXY: booleanFromEnv.default(false),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),

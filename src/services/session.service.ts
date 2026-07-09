@@ -4,11 +4,12 @@ import { liveEvents } from '../lib/liveEvents.js';
 import { clampMinorUnits, fallbackMinorUnits, fromMinorUnits, roundMoney, toMinorUnits } from '../lib/money.js';
 import { ChargeAttemptModel, type ChargeAttemptRecord } from '../models/chargeAttempt.model.js';
 import { ICON_TYPES, SessionModel, type IconType, type SessionRecord, type SessionStatus } from '../models/session.model.js';
+import { WalletFundingModel } from '../models/walletFunding.model.js';
 import { WalletModel, type WalletRecord } from '../models/wallet.model.js';
 import { writeAuditLog } from './audit.service.js';
 import { fiberProvider } from './fiberProvider.js';
 
-const DEFAULT_WALLET_BALANCE_MINOR = toMinorUnits('1240.50');
+const LEGACY_PLACEHOLDER_BALANCE_MINOR = toMinorUnits('1240.50');
 const HISTORY_STATUSES: SessionStatus[] = ['settled', 'revoked', 'expired'];
 const OPEN_STATUSES: SessionStatus[] = ['active', 'paused'];
 
@@ -447,6 +448,25 @@ async function ensureWalletMoneyFields(walletId: string): Promise<void> {
   }
 }
 
+async function resetUntouchedLegacyPlaceholderBalance(walletId: string): Promise<void> {
+  const wallet = await WalletModel.findOne({ walletId });
+  if (!wallet) return;
+
+  const balanceMinor = walletBalanceMinor(wallet.toObject());
+  if (balanceMinor !== LEGACY_PLACEHOLDER_BALANCE_MINOR) return;
+
+  const [sessionCount, fundingCount] = await Promise.all([
+    SessionModel.countDocuments({ ownerWalletId: walletId }),
+    WalletFundingModel.countDocuments({ walletId })
+  ]);
+
+  if (sessionCount > 0 || fundingCount > 0) return;
+
+  wallet.balanceMinor = 0;
+  wallet.balance = 0;
+  await wallet.save();
+}
+
 export async function ensureWalletForAddress(address: string): Promise<WalletRecord> {
   const walletId = walletIdFromAddress(address);
   const wallet = await WalletModel.findOneAndUpdate(
@@ -455,27 +475,35 @@ export async function ensureWalletForAddress(address: string): Promise<WalletRec
       $set: { connected: true, address },
       $setOnInsert: {
         walletId,
-        balance: fromMinorUnits(DEFAULT_WALLET_BALANCE_MINOR),
-        balanceMinor: DEFAULT_WALLET_BALANCE_MINOR,
+        balance: 0,
+        balanceMinor: 0,
         currency: 'USDC'
       }
     },
     { upsert: true, new: true }
   );
 
-  const walletObject = wallet.toObject();
-  const balanceMinor = walletBalanceMinor(walletObject);
-  if (walletObject.balanceMinor !== balanceMinor) {
-    wallet.balanceMinor = balanceMinor;
-    wallet.balance = fromMinorUnits(balanceMinor, wallet.currency);
-    await wallet.save();
+  await resetUntouchedLegacyPlaceholderBalance(walletId);
+
+  const currentWallet = await WalletModel.findOne({ walletId });
+  if (!currentWallet) {
+    throw new ApiError(404, 'WALLET_NOT_FOUND', 'Connect with JoyID before loading FiberPass sessions.');
   }
 
-  return wallet.toObject();
+  const walletObject = currentWallet.toObject();
+  const balanceMinor = walletBalanceMinor(walletObject);
+  if (walletObject.balanceMinor !== balanceMinor) {
+    currentWallet.balanceMinor = balanceMinor;
+    currentWallet.balance = fromMinorUnits(balanceMinor, currentWallet.currency);
+    await currentWallet.save();
+  }
+
+  return currentWallet.toObject();
 }
 
 async function getWalletDocument(walletId: string) {
   await ensureWalletMoneyFields(walletId);
+  await resetUntouchedLegacyPlaceholderBalance(walletId);
   const wallet = await WalletModel.findOne({ walletId });
   if (!wallet) {
     throw new ApiError(404, 'WALLET_NOT_FOUND', 'Connect with JoyID before loading FiberPass sessions.');

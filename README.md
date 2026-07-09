@@ -25,7 +25,7 @@ API runs on `http://localhost:4000` by default. A real Fiber RPC URL is required
 
 ## Fiber Provider
 
-`FIBER_PROVIDER=rpc` is the only supported provider. Configure `FIBER_RPC_URL`, `FIBER_PEER_ID`, and optional `FIBER_API_KEY` for your Fiber node.
+`FIBER_PROVIDER=rpc` is the only supported provider. Configure `FIBER_RPC_URL`, `FIBER_PEER_ID`, and optional `FIBER_API_KEY` for your Fiber node. Configure `FIBERPASS_TREASURY_ADDRESS` to enable wallet funding requests.
 
 See `docs/fiber-network-spike.md` for integration notes.
 
@@ -39,6 +39,9 @@ All product endpoints are available at their current paths and under `/v1` alias
 - `POST /auth/verify`
 - `GET /auth/me`
 - `POST /auth/logout`
+- `GET /wallet/funding`
+- `POST /wallet/funding`
+- `POST /wallet/funding/:fundingId/confirm`
 - `GET /sessions/create-policy`
 - `GET /sessions`
 - `GET /events`
