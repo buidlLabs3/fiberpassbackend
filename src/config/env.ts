@@ -18,7 +18,7 @@ const envSchema = z.object({
   FRONTEND_ORIGIN: z.string().default('http://localhost:3000'),
   FIBER_NETWORK: z.string().default('testnet'),
   FIBER_PROVIDER: z.literal('rpc').default('rpc'),
-  FIBER_RPC_URL: z.string().min(1),
+  FIBER_RPC_URL: z.string().min(1).default('http://127.0.0.1:8227'),
   FIBER_API_KEY: z.string().optional().default(''),
   FIBER_PEER_ID: z.string().optional().default(''),
   REQUEST_BODY_LIMIT: z.string().default('128kb'),
