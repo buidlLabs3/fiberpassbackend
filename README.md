@@ -29,6 +29,10 @@ API runs on `http://localhost:4000` by default. A real Fiber RPC URL is required
 
 See `docs/fiber-network-spike.md` for integration notes.
 
+## Lock Scripts
+
+Vault lock-script drafts live in `lockscripts/`. The current `fiberpass-vault-lock` draft models testnet user vault cells with per-user lock args so funding records stay distinct across users.
+
 ## Core Endpoints
 
 All product endpoints are available at their current paths and under `/v1` aliases.

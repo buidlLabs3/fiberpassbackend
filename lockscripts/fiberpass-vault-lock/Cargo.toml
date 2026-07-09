@@ -1,0 +1,19 @@
+[package]
+name = "fiberpass-vault-lock"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ckb-std = { version = "0.16.4", default-features = false, features = ["allocator", "ckb-types"] }
+
+[features]
+default = []
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+overflow-checks = true
+panic = "abort"
+strip = true
