@@ -28,22 +28,24 @@ bytes 65-96 operator_lock_hash
 
 ## Cell Data
 
-Each vault cell data payload uses a compact fixed-width layout:
+A plain user deposit may create a vault cell with empty data. Empty-data cells are valid inputs/outputs so a normal wallet transfer to the vault address remains spendable.
+
+Structured vault cells use a compact fixed-width payload:
 
 ```text
 bytes 0-3    magic: "FPV1"
 byte  4      data version, currently 1
-bytes 5-36   account_id_hash
+bytes 5-36   vault_id_hash
 bytes 37-68  record_id_hash
 bytes 69-76  nonce, little-endian u64
 bytes 77-84  reserved_minor_units, little-endian u64
 ```
 
-`account_id_hash` lets the backend and indexer group all records for a user without exposing the raw backend wallet id on-chain.
+`vault_id_hash` must match the vault id in the lock args, keeping outputs grouped to the same user vault without exposing the raw backend wallet id on-chain.
 
 `record_id_hash` maps the cell to a funding/session ledger record. The cell outpoint is still the canonical record id after confirmation.
 
-`nonce` must increase when vault cells are rewritten. This gives the backend a cheap replay/stale-state check when indexing testnet transactions.
+`nonce` must increase when structured vault cells are rewritten. This gives the backend a cheap replay/stale-state check when indexing testnet transactions.
 
 ## Authorization
 
@@ -68,7 +70,7 @@ For a payment payout:
 
 1. Consume one or more vault cells with the same lock args.
 2. Include an operator auth input.
-3. Create a change vault output with the same lock args and same `account_id_hash`.
+3. Create a change vault output with the same lock args, either empty data or structured data with the same `vault_id_hash`.
 4. Wire payment output(s) to the app/Fiber settlement target.
 5. Backend records the spent outpoints, resulting change outpoint, and payment proof.
 

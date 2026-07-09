@@ -37,7 +37,7 @@ pub fn program_entry() -> i8 {
 fn run() -> Result<(), Error> {
     let args = load_vault_args()?;
     let action = load_action()?;
-    let state = validate_group_data()?;
+    let state = validate_group_data(&args)?;
 
     match action {
         ACTION_OWNER_REFUND => {
@@ -53,25 +53,25 @@ fn run() -> Result<(), Error> {
         _ => return Err(Error::InvalidAction),
     }
 
-    validate_outputs(&state)?;
+    validate_outputs(&args, &state)?;
     Ok(())
 }
 
 #[derive(Clone, Copy)]
 struct VaultArgs {
+    vault_id_hash: [u8; HASH_LEN],
     owner_lock_hash: [u8; HASH_LEN],
     operator_lock_hash: [u8; HASH_LEN],
 }
 
 #[derive(Clone, Copy)]
 struct VaultData {
-    account_id_hash: [u8; HASH_LEN],
+    vault_id_hash: [u8; HASH_LEN],
     nonce: u64,
 }
 
 #[derive(Clone, Copy)]
 struct GroupState {
-    account_id_hash: [u8; HASH_LEN],
     max_nonce: u64,
 }
 
@@ -84,11 +84,12 @@ fn load_vault_args() -> Result<VaultArgs, Error> {
         return Err(Error::InvalidArgs);
     }
 
-    let _vault_id_hash = read_hash(&bytes[1..33])?;
+    let vault_id_hash = read_hash(&bytes[1..33])?;
     let owner_lock_hash = read_hash(&bytes[33..65])?;
     let operator_lock_hash = read_hash(&bytes[65..97])?;
 
     Ok(VaultArgs {
+        vault_id_hash,
         owner_lock_hash,
         operator_lock_hash,
     })
@@ -101,21 +102,21 @@ fn load_action() -> Result<u8, Error> {
     bytes.first().copied().ok_or(Error::InvalidWitness)
 }
 
-fn validate_group_data() -> Result<GroupState, Error> {
-    let mut account_id_hash: Option<[u8; HASH_LEN]> = None;
+fn validate_group_data(args: &VaultArgs) -> Result<GroupState, Error> {
     let mut max_nonce = 0u64;
     let mut seen_input = false;
 
     for data in QueryIter::new(load_cell_data, Source::GroupInput) {
         seen_input = true;
+
+        if data.is_empty() {
+            continue;
+        }
+
         let vault_data = parse_vault_data(&data)?;
 
-        match account_id_hash {
-            Some(account) if account != vault_data.account_id_hash => {
-                return Err(Error::MixedAccount);
-            }
-            None => account_id_hash = Some(vault_data.account_id_hash),
-            _ => {}
+        if vault_data.vault_id_hash != args.vault_id_hash {
+            return Err(Error::MixedAccount);
         }
 
         if vault_data.nonce > max_nonce {
@@ -127,17 +128,18 @@ fn validate_group_data() -> Result<GroupState, Error> {
         return Err(Error::ItemMissing);
     }
 
-    Ok(GroupState {
-        account_id_hash: account_id_hash.ok_or(Error::InvalidVaultData)?,
-        max_nonce,
-    })
+    Ok(GroupState { max_nonce })
 }
 
-fn validate_outputs(state: &GroupState) -> Result<(), Error> {
+fn validate_outputs(args: &VaultArgs, state: &GroupState) -> Result<(), Error> {
     for data in QueryIter::new(load_cell_data, Source::GroupOutput) {
+        if data.is_empty() {
+            continue;
+        }
+
         let vault_data = parse_vault_data(&data)?;
 
-        if vault_data.account_id_hash != state.account_id_hash {
+        if vault_data.vault_id_hash != args.vault_id_hash {
             return Err(Error::MixedAccount);
         }
 
@@ -163,13 +165,13 @@ fn parse_vault_data(data: &[u8]) -> Result<VaultData, Error> {
         return Err(Error::InvalidVaultData);
     }
 
-    let account_id_hash = read_hash(&data[5..37])?;
+    let vault_id_hash = read_hash(&data[5..37])?;
     let _record_id_hash = read_hash(&data[37..69])?;
     let nonce = read_u64_le(&data[69..77])?;
     let _reserved_minor_units = read_u64_le(&data[77..85])?;
 
     Ok(VaultData {
-        account_id_hash,
+        vault_id_hash,
         nonce,
     })
 }
