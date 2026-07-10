@@ -28,6 +28,8 @@ export interface AppDto {
   url: string;
   category: string;
   description: string;
+  webhookUrl?: string;
+  webhookConfigured: boolean;
   status: string;
   createdAt: string;
   updatedAt: string;
@@ -123,6 +125,8 @@ function toAppDto(app: AppRecord & { createdAt?: Date; updatedAt?: Date }): AppD
     url: app.url ?? '',
     category: app.category ?? 'API',
     description: app.description ?? '',
+    webhookUrl: app.webhookUrl ?? undefined,
+    webhookConfigured: Boolean(app.webhookUrl && app.webhookSigningSecret),
     status: app.status,
     createdAt: (app.createdAt ?? new Date()).toISOString(),
     updatedAt: (app.updatedAt ?? app.createdAt ?? new Date()).toISOString()
@@ -242,6 +246,46 @@ export async function createAppApiKey(appId: string, walletId: string, label = '
     ...toApiKeyDto(key.toObject()),
     secret
   };
+}
+
+
+export async function configureAppWebhook(input: {
+  appId: string;
+  ownerWalletId: string;
+  webhookUrl?: string;
+  signingSecret?: string;
+}): Promise<AppDto> {
+  const app = await getOwnedAppOrThrow(input.appId, input.ownerWalletId);
+  const webhookUrl = input.webhookUrl?.trim();
+  const signingSecret = input.signingSecret?.trim();
+
+  if (!webhookUrl) {
+    app.webhookUrl = undefined;
+    app.webhookSigningSecret = undefined;
+    app.webhookSecretHash = undefined;
+    await app.save();
+    await writeAuditLog({ actorWalletId: input.ownerWalletId, action: 'app.webhook.disabled', targetType: 'app', targetId: input.appId });
+    return toAppDto(app.toObject());
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(webhookUrl);
+  } catch {
+    throw new ApiError(400, 'INVALID_WEBHOOK_URL', 'Webhook URL must be a valid HTTPS URL.');
+  }
+
+  if (parsedUrl.protocol !== 'https:' && process.env.NODE_ENV === 'production') {
+    throw new ApiError(400, 'INVALID_WEBHOOK_URL', 'Production webhook URLs must use HTTPS.');
+  }
+
+  const nextSecret = signingSecret || app.webhookSigningSecret || 'fpwhsec_' + randomBytes(32).toString('hex');
+  app.webhookUrl = webhookUrl;
+  app.webhookSigningSecret = nextSecret;
+  app.webhookSecretHash = createHash('sha256').update(nextSecret).digest('hex');
+  await app.save();
+  await writeAuditLog({ actorWalletId: input.ownerWalletId, action: 'app.webhook.configured', targetType: 'app', targetId: input.appId, metadata: { webhookUrl } });
+  return toAppDto(app.toObject());
 }
 
 export async function revokeAppApiKey(appId: string, keyId: string, walletId: string): Promise<AppApiKeyDto> {

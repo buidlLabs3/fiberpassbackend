@@ -14,7 +14,10 @@ import {
   PaymentJobModel,
   RecipientModel
 } from '../models/automation.model.js';
+import { AppModel } from '../models/app.model.js';
+import { WebhookDeliveryModel } from '../models/webhookDelivery.model.js';
 import { hashFiberInvoice, isFatalPaymentJobError, normalizeFiberInvoice, normalizePaymentWorkerId, paymentJobBackoffMs } from '../services/automation.service.js';
+import { signWebhookPayload, webhookBackoffMs } from '../services/webhook.service.js';
 
 assert.equal(canTransitionInvoice('draft', 'queued'), true);
 assert.equal(canTransitionInvoice('queued', 'paid'), false);
@@ -34,6 +37,13 @@ assert.equal(canTransitionPaymentJob('locked', 'processing'), true);
 assert.equal(canTransitionPaymentJob('succeeded', 'queued'), false);
 assert.equal(isFinalPaymentJobStatus('failed'), true);
 assert.equal(isFinalPaymentJobStatus('retrying'), false);
+
+assert.equal(canTransitionInvoice('failed', 'queued'), true);
+assert.equal(canTransitionInvoice('paid', 'cancelled'), false);
+assert.equal(canTransitionBatch('partial', 'completed'), true);
+assert.equal(canTransitionBatch('cancelled', 'queued'), false);
+assert.equal(canTransitionPaymentJob('retrying', 'queued'), true);
+assert.equal(canTransitionPaymentJob('failed', 'retrying'), false);
 
 assert.doesNotThrow(() => validateAutomationSafetyEnvelope({
   sessionId: 'fp_pass_test',
@@ -77,9 +87,29 @@ assert.notEqual(hashFiberInvoice('invoice-one'), hashFiberInvoice('invoice-two')
 
 
 assert.equal(isFatalPaymentJobError('SESSION_LIMIT_EXCEEDED'), true);
+
+assert.equal(isFatalPaymentJobError('SESSION_NOT_CHARGEABLE'), true);
+assert.equal(isFatalPaymentJobError('SESSION_EXPIRED'), true);
 assert.equal(isFatalPaymentJobError('FIBER_PAYMENT_FAILED'), false);
 assert.equal(paymentJobBackoffMs(1), 1000);
 assert.equal(paymentJobBackoffMs(4), 8000);
 assert.equal(paymentJobBackoffMs(99), 60000);
 assert.equal(normalizePaymentWorkerId('  worker-a  '), 'worker-a');
 assert.equal(normalizePaymentWorkerId('   '), 'fiberpass-payment-worker');
+
+assert.equal(webhookBackoffMs(1), 2000);
+assert.equal(webhookBackoffMs(4), 16000);
+assert.equal(webhookBackoffMs(99), 120000);
+assert.equal(signWebhookPayload('secret', '123', '{"ok":true}'), signWebhookPayload('secret', '123', '{"ok":true}'));
+assert.notEqual(signWebhookPayload('secret', '123', '{"ok":true}'), signWebhookPayload('secret', '123', '{"ok":false}'));
+assert.match(signWebhookPayload('secret', '123', '{"ok":true}'), /^sha256=[a-f0-9]{64}$/);
+
+
+
+assert.ok(AppModel.schema.path('webhookUrl'));
+assert.ok(AppModel.schema.path('webhookSecretHash'));
+assert.ok(AppModel.schema.path('webhookSigningSecret'));
+
+const webhookIndexes = WebhookDeliveryModel.schema.indexes().map(([fields]) => fields);
+assert.ok(webhookIndexes.some((fields) => Object.prototype.hasOwnProperty.call(fields, 'deliveryId')));
+assert.ok(webhookIndexes.some((fields) => Object.prototype.hasOwnProperty.call(fields, 'status') && Object.prototype.hasOwnProperty.call(fields, 'runAfter')));

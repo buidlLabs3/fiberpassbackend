@@ -12,7 +12,10 @@
     "vault:build": "node lockscripts/fiberpass-vault-lock/scripts/build-and-hash.mjs",
     "vault:deploy:testnet": "node lockscripts/fiberpass-vault-lock/scripts/deploy-testnet.mjs",
     "worker:payments": "tsx src/workers/paymentWorker.ts",
-    "start:worker:payments": "node dist/workers/paymentWorker.js"
+    "start:worker:payments": "node dist/workers/paymentWorker.js",
+    "worker:webhooks": "tsx src/workers/webhookWorker.ts",
+    "start:worker:webhooks": "node dist/workers/webhookWorker.js",
+    "demo:automation": "node scripts/automation-e2e-demo.mjs"
   },
   "dependencies": {
     "@ckb-lumos/lumos": "^0.23.0",

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { AUTOMATION_AUDIT_ACTIONS, type PaymentBatchStatus } from '../domain/automation.js';
+import { env } from '../config/env.js';
 import { ApiError } from '../lib/errors.js';
 import { fallbackMinorUnits, fromMinorUnits, toMinorUnits } from '../lib/money.js';
 import { FIBER_CKB_ADDRESS_ERROR, isFiberCkbAddress } from '../lib/fiberAddress.js';
@@ -9,6 +10,7 @@ import { ChargeAttemptModel } from '../models/chargeAttempt.model.js';
 import { SessionModel, type SessionRecord } from '../models/session.model.js';
 import { writeAuditLog } from './audit.service.js';
 import { chargeSession } from './session.service.js';
+import { enqueueWebhookEvent } from './webhook.service.js';
 
 type InvoiceDocument = any;
 type PaymentJobDocument = any;
@@ -103,6 +105,32 @@ export interface InvoiceDto {
   lastFailureCode?: string;
   lastFailureMessage?: string;
   metadata?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PaymentJobDto {
+  id: string;
+  appId: string;
+  sessionId: string;
+  invoiceId: string;
+  recipientId: string;
+  batchId?: string;
+  amount: number;
+  amountMinor: number;
+  currency: string;
+  status: string;
+  attempts: number;
+  maxAttempts: number;
+  runAfter: string;
+  lockedAt?: string;
+  lockedBy?: string;
+  startedAt?: string;
+  succeededAt?: string;
+  failedAt?: string;
+  cancelledAt?: string;
+  lastFailureCode?: string;
+  lastFailureMessage?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -267,6 +295,80 @@ function toPaymentBatchDto(
   };
 }
 
+
+function toPaymentJobDto(record: PaymentJobRecord & { createdAt?: Date; updatedAt?: Date }): PaymentJobDto {
+  return {
+    id: record.jobId,
+    appId: record.appId,
+    sessionId: record.sessionId,
+    invoiceId: record.invoiceId,
+    recipientId: record.recipientId,
+    batchId: record.batchId ?? undefined,
+    amount: fromMinorUnits(record.amountMinor, record.currency),
+    amountMinor: record.amountMinor,
+    currency: record.currency,
+    status: record.status,
+    attempts: record.attempts,
+    maxAttempts: record.maxAttempts,
+    runAfter: record.runAfter.toISOString(),
+    lockedAt: record.lockedAt?.toISOString(),
+    lockedBy: record.lockedBy ?? undefined,
+    startedAt: record.startedAt?.toISOString(),
+    succeededAt: record.succeededAt?.toISOString(),
+    failedAt: record.failedAt?.toISOString(),
+    cancelledAt: record.cancelledAt?.toISOString(),
+    lastFailureCode: record.lastFailureCode ?? undefined,
+    lastFailureMessage: record.lastFailureMessage ?? undefined,
+    createdAt: (record.createdAt ?? new Date()).toISOString(),
+    updatedAt: (record.updatedAt ?? record.createdAt ?? new Date()).toISOString()
+  };
+}
+
+function safeEnqueueWebhookEvent(input: Parameters<typeof enqueueWebhookEvent>[0]): void {
+  void enqueueWebhookEvent(input).catch(() => undefined);
+}
+
+function automationLimitMinor(value: number, currency: string): number {
+  return toMinorUnits(String(value), currency);
+}
+
+async function dailyAutomationExposureMinor(actor: AutomationActor, currency: string): Promise<number> {
+  const startOfDay = new Date();
+  startOfDay.setUTCHours(0, 0, 0, 0);
+  const invoices = await InvoiceModel.find({
+    appId: actor.appId,
+    ownerWalletId: actor.ownerWalletId,
+    currency,
+    status: { $ne: 'cancelled' },
+    createdAt: { $gte: startOfDay }
+  }).select('amountMinor').lean<Array<{ amountMinor?: number }>>();
+  return invoices.reduce((total, invoice) => total + (invoice.amountMinor ?? 0), 0);
+}
+
+async function validateAutomationSafetyLimits(input: {
+  actor: AutomationActor;
+  session: SessionRecord;
+  amountMinor: number;
+  kind: 'invoice' | 'batch';
+}): Promise<void> {
+  const currency = input.session.currency;
+  const maxInvoiceMinor = automationLimitMinor(env.AUTOMATION_MAX_INVOICE_CKB, currency);
+  const maxBatchMinor = automationLimitMinor(env.AUTOMATION_MAX_BATCH_CKB, currency);
+  const dailyLimitMinor = automationLimitMinor(env.AUTOMATION_DAILY_LIMIT_CKB, currency);
+
+  if (input.kind === 'invoice' && input.amountMinor > maxInvoiceMinor) {
+    throw new ApiError(400, 'AUTOMATION_INVOICE_LIMIT_EXCEEDED', 'Invoice exceeds the per-invoice automation safety limit.');
+  }
+  if (input.kind === 'batch' && input.amountMinor > maxBatchMinor) {
+    throw new ApiError(400, 'AUTOMATION_BATCH_LIMIT_EXCEEDED', 'Batch exceeds the per-batch automation safety limit.');
+  }
+
+  const exposureMinor = await dailyAutomationExposureMinor(input.actor, currency);
+  if (exposureMinor + input.amountMinor > dailyLimitMinor) {
+    throw new ApiError(429, 'AUTOMATION_DAILY_LIMIT_EXCEEDED', 'Automation daily limit reached for this app.');
+  }
+}
+
 function normalizeOptionalDate(value?: string): Date | undefined {
   const normalized = value?.trim();
   if (!normalized) return undefined;
@@ -342,6 +444,10 @@ async function getAutomationSession(actor: AutomationActor, sessionId: string, a
 
   if (session.status !== 'active') {
     throw new ApiError(409, 'SESSION_NOT_CHARGEABLE', 'Invoices can only be created for active FiberPass sessions.');
+  }
+
+  if (!session.autoMicroCharges) {
+    throw new ApiError(403, 'AUTOMATION_NOT_ALLOWED', 'This FiberPass was not created with automation permission enabled.');
   }
 
   const expiryAt = session.expiryAt instanceof Date ? session.expiryAt : undefined;
@@ -510,6 +616,7 @@ async function refreshPaymentBatchRollup(actor: AutomationActor, batchId?: strin
   else nextStatus = 'draft';
 
   const failedInvoice = invoices.find((invoice) => invoice.status === 'failed' && invoice.lastFailureCode);
+  const previousStatus = batch.status;
   batch.status = nextStatus;
   batch.invoiceCount = invoiceCount;
   batch.paidCount = paidCount;
@@ -522,6 +629,24 @@ async function refreshPaymentBatchRollup(actor: AutomationActor, batchId?: strin
   batch.lastFailureCode = failedInvoice?.lastFailureCode ?? undefined;
   batch.lastFailureMessage = failedInvoice?.lastFailureMessage ?? undefined;
   await batch.save();
+
+  if (previousStatus !== nextStatus && nextStatus === 'completed') {
+    safeEnqueueWebhookEvent({
+      ownerWalletId: batch.ownerWalletId,
+      appId: batch.appId,
+      eventType: 'batch.completed',
+      targetType: 'payment_batch',
+      targetId: batch.batchId,
+      payload: {
+        batchId: batch.batchId,
+        sessionId: batch.sessionId,
+        status: nextStatus,
+        invoiceCount,
+        paidCount,
+        failedCount
+      }
+    });
+  }
 }
 
 async function createOrResetPaymentJob(actor: AutomationActor, invoice: InvoiceDocument, now: Date): Promise<PaymentJobDocument> {
@@ -613,6 +738,29 @@ async function queueInvoiceDocument(actor: AutomationActor, invoice: InvoiceDocu
   });
 
   await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
+}
+
+
+async function cancelSessionAutomationAfterFatalFailure(actor: AutomationActor, sessionId: string, failure: { code: string; message: string }): Promise<void> {
+  const now = new Date();
+  await PaymentJobModel.updateMany(
+    { sessionId, appId: actor.appId, ownerWalletId: actor.ownerWalletId, status: { $in: ['queued', 'retrying', 'locked'] } },
+    { $set: { status: 'cancelled', cancelledAt: now, lastFailureCode: failure.code, lastFailureMessage: failure.message } }
+  );
+  await InvoiceModel.updateMany(
+    { sessionId, appId: actor.appId, ownerWalletId: actor.ownerWalletId, status: { $in: ['draft', 'queued'] } },
+    { $set: { status: 'failed', failedAt: now, lastFailureCode: failure.code, lastFailureMessage: failure.message } }
+  );
+
+  const batchIds = await InvoiceModel.distinct('batchId', {
+    sessionId,
+    appId: actor.appId,
+    ownerWalletId: actor.ownerWalletId,
+    batchId: { $exists: true, $ne: null }
+  });
+  for (const batchId of batchIds.filter(Boolean)) {
+    await refreshPaymentBatchRollup(actor, String(batchId));
+  }
 }
 
 async function cancelBatchAfterFatalFailure(actor: AutomationActor, batchId: string, failure: { code: string; message: string }): Promise<void> {
@@ -790,6 +938,27 @@ async function processPaymentJob(job: PaymentJobDocument, workerId: string): Pro
       metadata: { appId: job.appId, invoiceId: job.invoiceId, sessionId: job.sessionId, workerId }
     });
 
+    safeEnqueueWebhookEvent({
+      ownerWalletId: job.ownerWalletId,
+      appId: invoice.appId,
+      eventType: 'invoice.paid',
+      targetType: 'invoice',
+      targetId: invoice.invoiceId,
+      payload: { invoice: toInvoiceDto(invoice.toObject()) }
+    });
+
+    const session = await SessionModel.findOne({ publicId: invoice.sessionId }).lean<SessionRecord | null>();
+    if (session && session.status === 'expired' && sessionLimitMinor(session) <= sessionSpentMinor(session)) {
+      safeEnqueueWebhookEvent({
+        ownerWalletId: job.ownerWalletId,
+        appId: invoice.appId,
+        eventType: 'session.limit_exhausted',
+        targetType: 'session',
+        targetId: invoice.sessionId,
+        payload: { sessionId: invoice.sessionId, status: session.status, spentMinor: sessionSpentMinor(session), limitMinor: sessionLimitMinor(session) }
+      });
+    }
+
     await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
     return 'succeeded';
   } catch (error) {
@@ -814,9 +983,21 @@ async function processPaymentJob(job: PaymentJobDocument, workerId: string): Pro
       metadata: { appId: invoice.appId, sessionId: invoice.sessionId, jobId: job.jobId, failureCode: failure.code }
     });
 
+    safeEnqueueWebhookEvent({
+      ownerWalletId: job.ownerWalletId,
+      appId: invoice.appId,
+      eventType: 'invoice.failed',
+      targetType: 'invoice',
+      targetId: invoice.invoiceId,
+      payload: { invoice: toInvoiceDto(invoice.toObject()), failure }
+    });
+
     const outcome = await failJob(failure);
-    if (invoice.batchId && isFatalPaymentJobError(failure.code)) {
-      await cancelBatchAfterFatalFailure(actor, invoice.batchId, failure);
+    if (isFatalPaymentJobError(failure.code)) {
+      await cancelSessionAutomationAfterFatalFailure(actor, invoice.sessionId, failure);
+      if (invoice.batchId) {
+        await cancelBatchAfterFatalFailure(actor, invoice.batchId, failure);
+      }
     } else {
       await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
     }
@@ -959,6 +1140,7 @@ export async function createInvoice(actor: AutomationActor, input: CreateInvoice
     throw new ApiError(400, 'INVALID_INVOICE_AMOUNT', 'Invoice amount must be greater than zero.');
   }
 
+  await validateAutomationSafetyLimits({ actor, session, amountMinor, kind: 'invoice' });
   await validateInvoiceCapacity({ actor, session, sessionId: input.sessionId, newAmountMinor: amountMinor });
   const invoiceRecord = buildInvoiceRecord({ actor, sessionId: input.sessionId, invoice: input, amountMinor, currency: session.currency });
   const invoice = await InvoiceModel.create(invoiceRecord);
@@ -996,10 +1178,14 @@ export async function createInvoiceBatch(actor: AutomationActor, input: CreateIn
     if (amountMinor <= 0) {
       throw new ApiError(400, 'INVALID_INVOICE_AMOUNT', 'Invoice amount must be greater than zero.');
     }
+    if (amountMinor > automationLimitMinor(env.AUTOMATION_MAX_INVOICE_CKB, session.currency)) {
+      throw new ApiError(400, 'AUTOMATION_INVOICE_LIMIT_EXCEEDED', 'One or more batch invoices exceed the per-invoice automation safety limit.');
+    }
     totalAmountMinor += amountMinor;
     invoiceRecords.push(buildInvoiceRecord({ actor, sessionId: input.sessionId, batchId, invoice, amountMinor, currency: session.currency }));
   }
 
+  await validateAutomationSafetyLimits({ actor, session, amountMinor: totalAmountMinor, kind: 'batch' });
   await validateInvoiceCapacity({ actor, session, sessionId: input.sessionId, newAmountMinor: totalAmountMinor });
 
   const batch = await PaymentBatchModel.create({
@@ -1058,6 +1244,18 @@ export async function listPaymentBatches(actor: AutomationActor, sessionId?: str
       invoices.filter((invoice) => invoice.batchId === batch.batchId).map(toInvoiceDto)
     ))
   };
+}
+
+
+export async function listPaymentJobs(actor: AutomationActor, sessionId?: string): Promise<{ jobs: PaymentJobDto[] }> {
+  await ensureActorApp(actor);
+  const jobs = await PaymentJobModel.find({
+    appId: actor.appId,
+    ownerWalletId: actor.ownerWalletId,
+    ...(sessionId ? { sessionId } : {})
+  }).sort({ createdAt: -1 }).limit(200).lean<(PaymentJobRecord & { createdAt?: Date; updatedAt?: Date })[]>();
+
+  return { jobs: jobs.map(toPaymentJobDto) };
 }
 
 export async function queueInvoice(actor: AutomationActor, invoiceId: string): Promise<InvoiceDto> {

@@ -23,11 +23,28 @@ npm run dev
 
 API runs on `http://localhost:4000` by default. A real Fiber RPC URL is required through `FIBER_RPC_URL`; the backend exposes only product endpoints backed by the configured Fiber RPC provider.
 
+Automation requires the API plus payment and webhook workers when queued invoices or callbacks are enabled:
+
+```bash
+npm run worker:payments
+npm run worker:webhooks
+```
+
 ## Fiber Provider
 
 `FIBER_PROVIDER=rpc` is the only supported provider. Configure `FIBER_RPC_URL`, `FIBER_PEER_ID`, and optional `FIBER_API_KEY` for your Fiber node. Configure `FIBERPASS_VAULT_CODE_HASH`, `FIBERPASS_VAULT_HASH_TYPE`, and `FIBERPASS_OPERATOR_LOCK_HASH` after deploying the vault lock script so funding requests derive per-user vault addresses. `FIBERPASS_TREASURY_ADDRESS` remains a temporary fallback while vault deployment is not configured.
 
 See `docs/fiber-network-spike.md` for integration notes.
+
+## Automation
+
+Automation docs live in:
+
+- `docs/automation-api.md`
+- `docs/automation-e2e-demo.md`
+- `docs/automation-deployment.md`
+
+Run the real API-driven demo flow with `npm run demo:automation` after exporting the required wallet auth token, app id, session id, recipients, and Fiber invoice/payment requests.
 
 ## Lock Scripts
 
@@ -59,6 +76,17 @@ All product endpoints are available at their current paths and under `/v1` alias
 - `POST /apps`
 - `POST /apps/:appId/api-keys`
 - `POST /apps/:appId/api-keys/:keyId/revoke`
+- `POST /apps/:appId/webhook`
+- `GET /apps/:appId/webhook-deliveries`
+- `GET /apps/:appId/recipients`
+- `POST /apps/:appId/recipients`
+- `GET /apps/:appId/invoices`
+- `POST /apps/:appId/invoices`
+- `POST /apps/:appId/invoices/:invoiceId/queue`
+- `GET /apps/:appId/invoice-batches`
+- `POST /apps/:appId/invoice-batches`
+- `POST /apps/:appId/invoice-batches/:batchId/queue`
+- `GET /apps/:appId/payment-jobs`
 - `GET /apps/:appId/charges`
 - `POST /apps/:appId/charges`
 
@@ -68,3 +96,5 @@ All product endpoints are available at their current paths and under `/v1` alias
 npm run build
 npm test
 ```
+
+The existing Mongoose duplicate-index warning is non-blocking test output; build and test exit codes must remain zero.
