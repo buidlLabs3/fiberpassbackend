@@ -3,14 +3,22 @@ import { config as lumosConfig, helpers } from '@ckb-lumos/lumos';
 import { verifyCredential, verifySignature, type SignChallengeResponseData } from '@joyid/ckb';
 import { env } from '../config/env.js';
 import { ApiError } from '../lib/errors.js';
-import { fallbackMinorUnits } from '../lib/money.js';
+import { fallbackMinorUnits, fromMinorUnits } from '../lib/money.js';
+import { AppApiKeyModel, AppModel } from '../models/app.model.js';
 import { AuthChallengeModel, AuthSessionModel } from '../models/auth.model.js';
+import { ChargeAttemptModel } from '../models/chargeAttempt.model.js';
+import { SessionModel } from '../models/session.model.js';
+import { WalletFundingModel } from '../models/walletFunding.model.js';
+import { WalletModel } from '../models/wallet.model.js';
 import { writeAuditLog } from './audit.service.js';
+import { syncWalletFunding } from './walletFunding.service.js';
 import type { AuthContext } from '../types/auth.js';
 import { ensureWalletForAddress, walletIdFromAddress, type WalletDto } from './session.service.js';
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const LEGACY_EVM_ADDRESS_PATTERN = /^0x[0-9a-f]{40}$/;
+type WalletRecordDto = Awaited<ReturnType<typeof ensureWalletForAddress>>;
 
 export interface AuthChallengeDto {
   challengeId: string;
@@ -23,6 +31,7 @@ export interface AuthVerifyInput {
   challengeId: string;
   address: string;
   signature: SignChallengeResponseData;
+  legacyEvmAddress?: string;
 }
 
 export interface AuthVerifyDto {
@@ -47,6 +56,150 @@ function normalizeAddress(address: string): string {
 
 function balanceMinorForWallet(wallet: { balance?: number | null; balanceMinor?: number | null; currency?: string | null }): number {
   return fallbackMinorUnits(wallet.balanceMinor, wallet.balance, wallet.currency ?? 'CKB');
+}
+
+function normalizeLegacyEvmAddress(address?: string): string | undefined {
+  const normalized = address?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return LEGACY_EVM_ADDRESS_PATTERN.test(normalized) ? normalized : undefined;
+}
+
+function modifiedCount(result: { modifiedCount?: number }): number {
+  return typeof result.modifiedCount === 'number' ? result.modifiedCount : 0;
+}
+
+async function syncLegacyPendingFunding(legacyWalletId: string, legacyAddress: string): Promise<void> {
+  const pendingFundingCount = await WalletFundingModel.countDocuments({
+    walletId: legacyWalletId,
+    status: 'pending',
+    depositMode: 'vault'
+  });
+  if (pendingFundingCount === 0) return;
+
+  try {
+    await syncWalletFunding(legacyWalletId);
+  } catch (error) {
+    await writeAuditLog({
+      actorWalletId: legacyWalletId,
+      actorAddress: legacyAddress,
+      action: 'wallet_funding.legacy_sync_failed',
+      targetType: 'wallet',
+      targetId: legacyWalletId,
+      metadata: {
+        pendingFundingCount,
+        error: error instanceof Error ? error.message : 'Unknown legacy funding sync error'
+      }
+    });
+  }
+}
+
+async function normalizeLegacyWalletMoney(legacyWalletId: string): Promise<void> {
+  const wallet = await WalletModel.findOne({ walletId: legacyWalletId });
+  if (!wallet || wallet.currency !== 'CKB') return;
+
+  const balanceMinor = balanceMinorForWallet(wallet.toObject());
+  if (wallet.balanceMinor === balanceMinor && wallet.balance === fromMinorUnits(balanceMinor, wallet.currency)) return;
+
+  wallet.balanceMinor = balanceMinor;
+  wallet.balance = fromMinorUnits(balanceMinor, wallet.currency);
+  await wallet.save();
+}
+
+async function recoverLegacyJoyIdWallet(input: {
+  legacyEvmAddress?: string;
+  targetWallet: WalletRecordDto;
+  targetAddress: string;
+}): Promise<WalletRecordDto> {
+  const legacyAddress = normalizeLegacyEvmAddress(input.legacyEvmAddress);
+  if (!legacyAddress) return input.targetWallet;
+
+  const legacyWalletId = walletIdFromAddress(legacyAddress);
+  const targetWalletId = input.targetWallet.walletId;
+  if (legacyWalletId === targetWalletId) return input.targetWallet;
+
+  const [legacyWalletExists, fundingCount, sessionCount, chargeAttemptCount, appCount, apiKeyCount] = await Promise.all([
+    WalletModel.exists({ walletId: legacyWalletId }),
+    WalletFundingModel.countDocuments({ walletId: legacyWalletId }),
+    SessionModel.countDocuments({ ownerWalletId: legacyWalletId }),
+    ChargeAttemptModel.countDocuments({ ownerWalletId: legacyWalletId }),
+    AppModel.countDocuments({ ownerWalletId: legacyWalletId }),
+    AppApiKeyModel.countDocuments({ ownerWalletId: legacyWalletId })
+  ]);
+
+  if (!legacyWalletExists && fundingCount + sessionCount + chargeAttemptCount + appCount + apiKeyCount === 0) {
+    return input.targetWallet;
+  }
+
+  await syncLegacyPendingFunding(legacyWalletId, legacyAddress);
+  await normalizeLegacyWalletMoney(legacyWalletId);
+
+  const claimedLegacyWallet = await WalletModel.findOneAndUpdate(
+    { walletId: legacyWalletId, currency: 'CKB', balanceMinor: { $gt: 0 } },
+    { $set: { connected: false, balance: 0, balanceMinor: 0 } },
+    { new: false }
+  ).lean();
+
+  const recoveredBalanceMinor = claimedLegacyWallet ? balanceMinorForWallet(claimedLegacyWallet) : 0;
+  const recoveredBalance = fromMinorUnits(recoveredBalanceMinor, 'CKB');
+
+  if (recoveredBalanceMinor > 0) {
+    await WalletModel.updateOne(
+      { walletId: targetWalletId },
+      {
+        $set: { connected: true, address: input.targetAddress, currency: 'CKB' },
+        $inc: { balanceMinor: recoveredBalanceMinor, balance: recoveredBalance }
+      }
+    );
+  } else {
+    await WalletModel.updateOne(
+      { walletId: targetWalletId },
+      { $set: { connected: true, address: input.targetAddress, currency: 'CKB' } }
+    );
+  }
+
+  const [fundingResult, sessionResult, chargeAttemptResult, appResult, apiKeyResult, authSessionResult] = await Promise.all([
+    WalletFundingModel.updateMany(
+      { walletId: legacyWalletId, status: 'confirmed' },
+      { $set: { walletId: targetWalletId, walletAddress: input.targetAddress } }
+    ),
+    SessionModel.updateMany({ ownerWalletId: legacyWalletId }, { $set: { ownerWalletId: targetWalletId } }),
+    ChargeAttemptModel.updateMany({ ownerWalletId: legacyWalletId }, { $set: { ownerWalletId: targetWalletId } }),
+    AppModel.updateMany({ ownerWalletId: legacyWalletId }, { $set: { ownerWalletId: targetWalletId } }),
+    AppApiKeyModel.updateMany({ ownerWalletId: legacyWalletId }, { $set: { ownerWalletId: targetWalletId } }),
+    AuthSessionModel.updateMany({ walletId: legacyWalletId }, { $set: { walletId: targetWalletId, address: input.targetAddress } })
+  ]);
+
+  await WalletModel.updateOne({ walletId: legacyWalletId }, { $set: { connected: false } });
+
+  const movedRecords = {
+    funding: modifiedCount(fundingResult),
+    sessions: modifiedCount(sessionResult),
+    chargeAttempts: modifiedCount(chargeAttemptResult),
+    apps: modifiedCount(appResult),
+    apiKeys: modifiedCount(apiKeyResult),
+    authSessions: modifiedCount(authSessionResult)
+  };
+  const movedRecordCount = Object.values(movedRecords).reduce((total, count) => total + count, 0);
+
+  if (recoveredBalanceMinor > 0 || movedRecordCount > 0) {
+    await writeAuditLog({
+      actorWalletId: targetWalletId,
+      actorAddress: input.targetAddress,
+      action: 'wallet.legacy_identity_recovered',
+      targetType: 'wallet',
+      targetId: targetWalletId,
+      metadata: {
+        legacyWalletId,
+        legacyAddress,
+        recoveredBalance,
+        recoveredBalanceMinor,
+        movedRecords
+      }
+    });
+  }
+
+  const currentTargetWallet = await WalletModel.findOne({ walletId: targetWalletId });
+  return currentTargetWallet ? currentTargetWallet.toObject() : input.targetWallet;
 }
 
 function walletDto(input: { connected?: boolean; address: string; balance: number; balanceMinor?: number | null; currency: string }): WalletDto {
@@ -144,7 +297,11 @@ export async function verifyAuthChallenge(input: AuthVerifyInput): Promise<AuthV
   challenge.consumedAt = new Date();
   await challenge.save();
 
-  const wallet = await ensureWalletForAddress(normalizedAddress);
+  const wallet = await recoverLegacyJoyIdWallet({
+    legacyEvmAddress: input.legacyEvmAddress,
+    targetWallet: await ensureWalletForAddress(normalizedAddress),
+    targetAddress: normalizedAddress
+  });
   const token = randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
   await AuthSessionModel.create({

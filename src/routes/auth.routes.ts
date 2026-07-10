@@ -26,7 +26,8 @@ const joyIdSignatureSchema = z.object({
 const verifySchema = z.object({
   challengeId: z.string().uuid(),
   address: z.string().trim().min(1),
-  signature: joyIdSignatureSchema
+  signature: joyIdSignatureSchema,
+  legacyEvmAddress: z.string().trim().regex(/^0x[0-9a-fA-F]{40}$/).optional()
 });
 
 export const authRouter = Router();
