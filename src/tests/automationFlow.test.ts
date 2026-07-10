@@ -14,7 +14,7 @@ import {
   PaymentJobModel,
   RecipientModel
 } from '../models/automation.model.js';
-import { hashFiberInvoice, normalizeFiberInvoice } from '../services/automation.service.js';
+import { hashFiberInvoice, isFatalPaymentJobError, normalizeFiberInvoice, normalizePaymentWorkerId, paymentJobBackoffMs } from '../services/automation.service.js';
 
 assert.equal(canTransitionInvoice('draft', 'queued'), true);
 assert.equal(canTransitionInvoice('queued', 'paid'), false);
@@ -75,3 +75,11 @@ assert.equal(normalizeFiberInvoice('   '), undefined);
 assert.equal(hashFiberInvoice('  invoice-one  '), hashFiberInvoice('invoice-one'));
 assert.notEqual(hashFiberInvoice('invoice-one'), hashFiberInvoice('invoice-two'));
 
+
+assert.equal(isFatalPaymentJobError('SESSION_LIMIT_EXCEEDED'), true);
+assert.equal(isFatalPaymentJobError('FIBER_PAYMENT_FAILED'), false);
+assert.equal(paymentJobBackoffMs(1), 1000);
+assert.equal(paymentJobBackoffMs(4), 8000);
+assert.equal(paymentJobBackoffMs(99), 60000);
+assert.equal(normalizePaymentWorkerId('  worker-a  '), 'worker-a');
+assert.equal(normalizePaymentWorkerId('   '), 'fiberpass-payment-worker');

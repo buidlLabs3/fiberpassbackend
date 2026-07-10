@@ -34,6 +34,8 @@ const envSchema = z.object({
   RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().default(600),
   RATE_LIMIT_AUTH_MAX: z.coerce.number().int().positive().default(20),
   RATE_LIMIT_APP_CHARGE_MAX: z.coerce.number().int().positive().default(120),
+  PAYMENT_WORKER_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  PAYMENT_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(10),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info')
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV === 'production' && env.FRONTEND_ORIGIN === '*') {

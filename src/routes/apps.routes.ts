@@ -8,7 +8,7 @@ import { requireAppApiKeyWithScopes } from '../middleware/appAuth.middleware.js'
 import { requireAuth } from '../middleware/auth.middleware.js';
 import { APP_API_KEY_SCOPES } from '../models/app.model.js';
 import { createAppApiKey, createDeveloperApp, listAppChargeAttempts, listDeveloperApps, revokeAppApiKey } from '../services/app.service.js';
-import { createInvoice, createInvoiceBatch, createRecipient, disableRecipient, listInvoices, listRecipients, updateRecipient, type AutomationActor } from '../services/automation.service.js';
+import { createInvoice, createInvoiceBatch, createRecipient, disableRecipient, listInvoices, listPaymentBatches, listRecipients, queueInvoice, queueInvoiceBatch, updateRecipient, type AutomationActor } from '../services/automation.service.js';
 import { chargeSession } from '../services/session.service.js';
 import type { AppAuthenticatedRequest } from '../types/appAuth.js';
 import type { AuthenticatedRequest } from '../types/auth.js';
@@ -31,7 +31,9 @@ const keySchema = z.object({
 const paramsSchema = z.object({
   appId: z.string().trim().min(1),
   keyId: z.string().trim().min(1).optional(),
-  recipientId: z.string().trim().min(1).optional()
+  recipientId: z.string().trim().min(1).optional(),
+  invoiceId: z.string().trim().min(1).optional(),
+  batchId: z.string().trim().min(1).optional()
 });
 
 const chargeSchema = z.object({
@@ -198,6 +200,22 @@ appsRouter.post('/apps/:appId/invoice-batches', requireAuth, asyncHandler(async 
   response.status(201).json(await createInvoiceBatch(walletAutomationActor(request, appId), payload));
 }));
 
+appsRouter.get('/apps/:appId/invoice-batches', requireAuth, asyncHandler(async (request, response) => {
+  const { appId } = paramsSchema.parse(request.params);
+  const query = invoiceQuerySchema.parse(request.query ?? {});
+  response.json(await listPaymentBatches(walletAutomationActor(request, appId), query.sessionId));
+}));
+
+appsRouter.post('/apps/:appId/invoices/:invoiceId/queue', requireAuth, asyncHandler(async (request, response) => {
+  const { appId, invoiceId } = paramsSchema.parse(request.params);
+  response.json(await queueInvoice(walletAutomationActor(request, appId), invoiceId ?? ''));
+}));
+
+appsRouter.post('/apps/:appId/invoice-batches/:batchId/queue', requireAuth, asyncHandler(async (request, response) => {
+  const { appId, batchId } = paramsSchema.parse(request.params);
+  response.json(await queueInvoiceBatch(walletAutomationActor(request, appId), batchId ?? ''));
+}));
+
 appsRouter.get('/apps/:appId/automation/invoices', requireAppApiKeyWithScopes(['invoices:create']), asyncHandler(async (request, response) => {
   const query = invoiceQuerySchema.parse(request.query ?? {});
   response.json(await listInvoices(appKeyAutomationActor(request), query.sessionId));
@@ -211,6 +229,21 @@ appsRouter.post('/apps/:appId/automation/invoices', requireAppApiKeyWithScopes([
 appsRouter.post('/apps/:appId/automation/invoice-batches', requireAppApiKeyWithScopes(['invoices:create']), asyncHandler(async (request, response) => {
   const payload = invoiceBatchSchema.parse(request.body ?? {});
   response.status(201).json(await createInvoiceBatch(appKeyAutomationActor(request), payload));
+}));
+
+appsRouter.get('/apps/:appId/automation/invoice-batches', requireAppApiKeyWithScopes(['invoices:create']), asyncHandler(async (request, response) => {
+  const query = invoiceQuerySchema.parse(request.query ?? {});
+  response.json(await listPaymentBatches(appKeyAutomationActor(request), query.sessionId));
+}));
+
+appsRouter.post('/apps/:appId/automation/invoices/:invoiceId/queue', requireAppApiKeyWithScopes(['payments:queue']), asyncHandler(async (request, response) => {
+  const { invoiceId } = paramsSchema.parse(request.params);
+  response.json(await queueInvoice(appKeyAutomationActor(request), invoiceId ?? ''));
+}));
+
+appsRouter.post('/apps/:appId/automation/invoice-batches/:batchId/queue', requireAppApiKeyWithScopes(['payments:queue']), asyncHandler(async (request, response) => {
+  const { batchId } = paramsSchema.parse(request.params);
+  response.json(await queueInvoiceBatch(appKeyAutomationActor(request), batchId ?? ''));
 }));
 
 appsRouter.get('/apps/:appId/charges', requireAuth, asyncHandler(async (request, response) => {

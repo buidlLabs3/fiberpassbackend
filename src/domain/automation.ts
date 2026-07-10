@@ -22,9 +22,12 @@ export const AUTOMATION_AUDIT_ACTIONS = {
   batchCreated: 'automation.batch.created',
   batchQueued: 'automation.batch.queued',
   batchCompleted: 'automation.batch.completed',
+  batchFailed: 'automation.batch.failed',
+  batchCancelled: 'automation.batch.cancelled',
   jobQueued: 'automation.job.queued',
   jobLocked: 'automation.job.locked',
   jobSucceeded: 'automation.job.succeeded',
+  jobRetrying: 'automation.job.retrying',
   jobFailed: 'automation.job.failed'
 } as const;
 

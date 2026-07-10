@@ -1,12 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { AUTOMATION_AUDIT_ACTIONS } from '../domain/automation.js';
+import { AUTOMATION_AUDIT_ACTIONS, type PaymentBatchStatus } from '../domain/automation.js';
 import { ApiError } from '../lib/errors.js';
 import { fallbackMinorUnits, fromMinorUnits, toMinorUnits } from '../lib/money.js';
 import { FIBER_CKB_ADDRESS_ERROR, isFiberCkbAddress } from '../lib/fiberAddress.js';
 import { AppModel, type AppRecord } from '../models/app.model.js';
-import { InvoiceModel, PaymentBatchModel, RecipientModel, type InvoiceRecord, type PaymentBatchRecord, type RecipientRecord } from '../models/automation.model.js';
+import { InvoiceModel, PaymentBatchModel, PaymentJobModel, RecipientModel, type InvoiceRecord, type PaymentBatchRecord, type PaymentJobRecord, type RecipientRecord } from '../models/automation.model.js';
+import { ChargeAttemptModel } from '../models/chargeAttempt.model.js';
 import { SessionModel, type SessionRecord } from '../models/session.model.js';
 import { writeAuditLog } from './audit.service.js';
+import { chargeSession } from './session.service.js';
+
+type InvoiceDocument = any;
+type PaymentJobDocument = any;
+
 
 export interface AutomationActor {
   appId: string;
@@ -115,9 +121,30 @@ export interface PaymentBatchDto {
   invoiceCount: number;
   paidCount: number;
   failedCount: number;
+  queuedAt?: string;
+  processingAt?: string;
+  completedAt?: string;
+  failedAt?: string;
+  cancelledAt?: string;
+  lastFailureCode?: string;
+  lastFailureMessage?: string;
+  metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
   invoices: InvoiceDto[];
+}
+
+export interface PaymentWorkerRunResult {
+  processed: number;
+  succeeded: number;
+  failed: number;
+  retried: number;
+  cancelled: number;
+}
+
+export interface RunPaymentWorkerOptions {
+  workerId?: string;
+  limit?: number;
 }
 
 
@@ -131,6 +158,10 @@ function newInvoiceId(): string {
 
 function newBatchId(): string {
   return 'fp_batch_' + randomUUID().replace(/-/g, '').slice(0, 16);
+}
+
+function newJobId(): string {
+  return 'fp_job_' + randomUUID().replace(/-/g, '').slice(0, 16);
 }
 
 export function normalizeFiberInvoice(value?: string): string | undefined {
@@ -222,6 +253,14 @@ function toPaymentBatchDto(
     invoiceCount: record.invoiceCount,
     paidCount: record.paidCount,
     failedCount: record.failedCount,
+    queuedAt: record.queuedAt?.toISOString(),
+    processingAt: record.processingAt?.toISOString(),
+    completedAt: record.completedAt?.toISOString(),
+    failedAt: record.failedAt?.toISOString(),
+    cancelledAt: record.cancelledAt?.toISOString(),
+    lastFailureCode: record.lastFailureCode ?? undefined,
+    lastFailureMessage: record.lastFailureMessage ?? undefined,
+    metadata: toMetadata(record.metadata),
     createdAt: (record.createdAt ?? new Date()).toISOString(),
     updatedAt: (record.updatedAt ?? record.createdAt ?? new Date()).toISOString(),
     invoices
@@ -370,6 +409,419 @@ function buildInvoiceRecord(input: {
     dueAt: normalizeOptionalDate(input.invoice.dueAt),
     metadata: input.invoice.metadata
   };
+}
+
+function paymentJobIdempotencyKey(invoice: InvoiceRecord): string | undefined {
+  return invoice.idempotencyKey ? invoice.idempotencyKey + ':payment-job' : undefined;
+}
+
+function ensureInvoicePaymentRequest(invoice: InvoiceRecord): string {
+  const fiberInvoice = normalizeFiberInvoice(invoice.fiberInvoice ?? undefined);
+  if (!fiberInvoice) {
+    throw new ApiError(400, 'FIBER_INVOICE_REQUIRED', 'A Fiber invoice/payment request is required before an invoice can be queued.');
+  }
+  return fiberInvoice;
+}
+
+function failureFromError(error: unknown): { code: string; message: string } {
+  if (error instanceof ApiError) {
+    return { code: error.code, message: error.message };
+  }
+  if (error instanceof Error) {
+    return { code: 'PAYMENT_JOB_FAILED', message: error.message };
+  }
+  return { code: 'PAYMENT_JOB_FAILED', message: 'Payment job failed.' };
+}
+
+const FATAL_PAYMENT_JOB_CODES = new Set([
+  'APP_NOT_FOUND',
+  'APP_SESSION_MISMATCH',
+  'FIBER_INVOICE_REQUIRED',
+  'SESSION_EXPIRED',
+  'SESSION_LIMIT_EXCEEDED',
+  'SESSION_NOT_CHARGEABLE'
+]);
+
+export function isFatalPaymentJobError(code: string): boolean {
+  return FATAL_PAYMENT_JOB_CODES.has(code);
+}
+
+export function paymentJobBackoffMs(attempts: number): number {
+  const safeAttempts = Number.isFinite(attempts) ? Math.max(1, Math.min(7, Math.floor(attempts))) : 1;
+  return Math.min(60000, 1000 * (2 ** (safeAttempts - 1)));
+}
+
+export function normalizePaymentWorkerId(value?: string): string {
+  const normalized = value?.trim();
+  return normalized || 'fiberpass-payment-worker';
+}
+
+function isDuplicateKeyError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: number }).code === 11000;
+}
+
+async function loadInvoiceForActor(actor: AutomationActor, invoiceId: string): Promise<InvoiceDocument> {
+  const invoice = await InvoiceModel.findOne({ invoiceId, appId: actor.appId, ownerWalletId: actor.ownerWalletId });
+  if (!invoice) {
+    throw new ApiError(404, 'INVOICE_NOT_FOUND', 'Invoice was not found for this app.');
+  }
+  return invoice;
+}
+
+async function loadBatchDto(actor: AutomationActor, batchId: string): Promise<PaymentBatchDto> {
+  const [batch, invoices] = await Promise.all([
+    PaymentBatchModel.findOne({ batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId }).lean<(PaymentBatchRecord & { createdAt?: Date; updatedAt?: Date }) | null>(),
+    InvoiceModel.find({ batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId }).sort({ createdAt: 1 }).lean<(InvoiceRecord & { createdAt?: Date; updatedAt?: Date })[]>()
+  ]);
+
+  if (!batch) {
+    throw new ApiError(404, 'PAYMENT_BATCH_NOT_FOUND', 'Payment batch was not found for this app.');
+  }
+
+  return toPaymentBatchDto(batch, invoices.map(toInvoiceDto));
+}
+
+async function refreshPaymentBatchRollup(actor: AutomationActor, batchId?: string): Promise<void> {
+  if (!batchId) return;
+
+  const [batch, invoices] = await Promise.all([
+    PaymentBatchModel.findOne({ batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId }),
+    InvoiceModel.find({ batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId }).select('status lastFailureCode lastFailureMessage').lean<Array<Pick<InvoiceRecord, 'status' | 'lastFailureCode' | 'lastFailureMessage'>>>()
+  ]);
+
+  if (!batch) return;
+
+  const now = new Date();
+  const invoiceCount = invoices.length;
+  const paidCount = invoices.filter((invoice) => invoice.status === 'paid').length;
+  const failedCount = invoices.filter((invoice) => invoice.status === 'failed').length;
+  const cancelledCount = invoices.filter((invoice) => invoice.status === 'cancelled').length;
+  const processingCount = invoices.filter((invoice) => invoice.status === 'processing').length;
+  const queuedCount = invoices.filter((invoice) => invoice.status === 'queued').length;
+  let nextStatus: PaymentBatchStatus = batch.status as PaymentBatchStatus;
+
+  if (invoiceCount === 0) nextStatus = 'draft';
+  else if (paidCount === invoiceCount) nextStatus = 'completed';
+  else if (cancelledCount === invoiceCount) nextStatus = 'cancelled';
+  else if (processingCount > 0) nextStatus = 'processing';
+  else if (queuedCount > 0) nextStatus = 'queued';
+  else if (paidCount > 0 && failedCount > 0) nextStatus = 'partial';
+  else if (failedCount > 0) nextStatus = 'failed';
+  else nextStatus = 'draft';
+
+  const failedInvoice = invoices.find((invoice) => invoice.status === 'failed' && invoice.lastFailureCode);
+  batch.status = nextStatus;
+  batch.invoiceCount = invoiceCount;
+  batch.paidCount = paidCount;
+  batch.failedCount = failedCount;
+  if (nextStatus === 'queued' && !batch.queuedAt) batch.queuedAt = now;
+  if (nextStatus === 'processing' && !batch.processingAt) batch.processingAt = now;
+  if (nextStatus === 'completed' && !batch.completedAt) batch.completedAt = now;
+  if ((nextStatus === 'failed' || nextStatus === 'partial') && !batch.failedAt) batch.failedAt = now;
+  if (nextStatus === 'cancelled' && !batch.cancelledAt) batch.cancelledAt = now;
+  batch.lastFailureCode = failedInvoice?.lastFailureCode ?? undefined;
+  batch.lastFailureMessage = failedInvoice?.lastFailureMessage ?? undefined;
+  await batch.save();
+}
+
+async function createOrResetPaymentJob(actor: AutomationActor, invoice: InvoiceDocument, now: Date): Promise<PaymentJobDocument> {
+  const runAfter = invoice.dueAt && invoice.dueAt.getTime() > now.getTime() ? invoice.dueAt : now;
+  let job = await PaymentJobModel.findOne({ invoiceId: invoice.invoiceId });
+
+  if (!job) {
+    try {
+      job = await PaymentJobModel.create({
+        jobId: newJobId(),
+        ownerWalletId: actor.ownerWalletId,
+        appId: actor.appId,
+        sessionId: invoice.sessionId,
+        invoiceId: invoice.invoiceId,
+        recipientId: invoice.recipientId,
+        batchId: invoice.batchId,
+        amount: fromMinorUnits(invoice.amountMinor, invoice.currency),
+        amountMinor: invoice.amountMinor,
+        currency: invoice.currency,
+        status: 'queued',
+        idempotencyKey: paymentJobIdempotencyKey(invoice.toObject()),
+        runAfter,
+        attempts: 0,
+        maxAttempts: 3,
+        metadata: auditMetadata(actor, {
+          queuedBy: actor.source,
+          queuedByKeyId: actor.keyId,
+          fiberInvoiceHash: invoice.fiberInvoiceHash
+        })
+      });
+    } catch (error) {
+      if (!isDuplicateKeyError(error)) throw error;
+      job = await PaymentJobModel.findOne({ invoiceId: invoice.invoiceId });
+    }
+  }
+
+  if (!job) {
+    throw new ApiError(500, 'PAYMENT_JOB_CREATE_FAILED', 'Payment job could not be created for this invoice.');
+  }
+
+  if (job.status === 'failed' || job.status === 'cancelled') {
+    job.status = 'queued';
+    job.runAfter = runAfter;
+    job.attempts = 0;
+    job.failedAt = undefined;
+    job.cancelledAt = undefined;
+    job.lastFailureCode = undefined;
+    job.lastFailureMessage = undefined;
+    job.set('lockedAt', undefined);
+    job.set('lockedBy', undefined);
+    await job.save();
+  }
+
+  return job;
+}
+
+async function queueInvoiceDocument(actor: AutomationActor, invoice: InvoiceDocument): Promise<void> {
+  if (invoice.status === 'paid' || invoice.status === 'cancelled') {
+    throw new ApiError(409, 'INVOICE_FINAL', 'Paid or cancelled invoices cannot be queued again.');
+  }
+
+  ensureInvoicePaymentRequest(invoice.toObject());
+  const now = new Date();
+  const job = await createOrResetPaymentJob(actor, invoice, now);
+  const nextInvoiceStatus = job.status === 'processing' || job.status === 'locked' ? 'processing' : 'queued';
+
+  invoice.status = nextInvoiceStatus;
+  invoice.queuedAt = invoice.queuedAt ?? now;
+  invoice.paymentJobId = job.jobId;
+  invoice.failedAt = undefined;
+  invoice.lastFailureCode = undefined;
+  invoice.lastFailureMessage = undefined;
+  await invoice.save();
+
+  await writeAuditLog({
+    actorWalletId: actor.ownerWalletId,
+    action: AUTOMATION_AUDIT_ACTIONS.invoiceQueued,
+    targetType: 'invoice',
+    targetId: invoice.invoiceId,
+    metadata: auditMetadata(actor, { jobId: job.jobId, sessionId: invoice.sessionId, batchId: invoice.batchId })
+  });
+
+  await writeAuditLog({
+    actorWalletId: actor.ownerWalletId,
+    action: AUTOMATION_AUDIT_ACTIONS.jobQueued,
+    targetType: 'payment_job',
+    targetId: job.jobId,
+    metadata: auditMetadata(actor, { invoiceId: invoice.invoiceId, sessionId: invoice.sessionId, batchId: invoice.batchId })
+  });
+
+  await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
+}
+
+async function cancelBatchAfterFatalFailure(actor: AutomationActor, batchId: string, failure: { code: string; message: string }): Promise<void> {
+  const now = new Date();
+  await PaymentJobModel.updateMany(
+    { batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId, status: { $in: ['queued', 'retrying', 'locked', 'processing'] } },
+    { $set: { status: 'cancelled', cancelledAt: now, lastFailureCode: failure.code, lastFailureMessage: failure.message } }
+  );
+  await InvoiceModel.updateMany(
+    { batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId, status: { $in: ['draft', 'queued', 'processing'] } },
+    { $set: { status: 'failed', failedAt: now, lastFailureCode: failure.code, lastFailureMessage: failure.message } }
+  );
+  await refreshPaymentBatchRollup(actor, batchId);
+  await writeAuditLog({
+    actorWalletId: actor.ownerWalletId,
+    action: AUTOMATION_AUDIT_ACTIONS.batchFailed,
+    targetType: 'payment_batch',
+    targetId: batchId,
+    metadata: auditMetadata(actor, failure)
+  });
+}
+
+async function lockNextPaymentJob(workerId: string): Promise<PaymentJobDocument | null> {
+  const now = new Date();
+  const job = await PaymentJobModel.findOneAndUpdate(
+    { status: { $in: ['queued', 'retrying'] }, runAfter: { $lte: now } },
+    { $set: { status: 'locked', lockedAt: now, lockedBy: workerId }, $inc: { attempts: 1 } },
+    { new: true, sort: { runAfter: 1, createdAt: 1 } }
+  );
+
+  if (job) {
+    await writeAuditLog({
+      actorWalletId: job.ownerWalletId,
+      action: AUTOMATION_AUDIT_ACTIONS.jobLocked,
+      targetType: 'payment_job',
+      targetId: job.jobId,
+      metadata: { appId: job.appId, sessionId: job.sessionId, invoiceId: job.invoiceId, workerId }
+    });
+  }
+
+  return job;
+}
+
+async function processPaymentJob(job: PaymentJobDocument, workerId: string): Promise<'succeeded' | 'failed' | 'retried' | 'cancelled'> {
+  const actor: AutomationActor = { appId: job.appId, ownerWalletId: job.ownerWalletId, source: 'wallet' };
+  const startedAt = new Date();
+  job.status = 'processing';
+  job.startedAt = startedAt;
+  await job.save();
+
+  const failJob = async (failure: { code: string; message: string }): Promise<'failed' | 'retried'> => {
+    const now = new Date();
+    const canRetry = job.attempts < job.maxAttempts && !isFatalPaymentJobError(failure.code);
+    job.lastFailureCode = failure.code;
+    job.lastFailureMessage = failure.message;
+    job.set('lockedAt', undefined);
+    job.set('lockedBy', undefined);
+
+    if (canRetry) {
+      job.status = 'retrying';
+      job.runAfter = new Date(now.getTime() + paymentJobBackoffMs(job.attempts));
+      await job.save();
+      await writeAuditLog({
+        actorWalletId: job.ownerWalletId,
+        action: AUTOMATION_AUDIT_ACTIONS.jobRetrying,
+        targetType: 'payment_job',
+        targetId: job.jobId,
+        metadata: { appId: job.appId, invoiceId: job.invoiceId, sessionId: job.sessionId, failureCode: failure.code, runAfter: job.runAfter }
+      });
+      return 'retried';
+    }
+
+    job.status = 'failed';
+    job.failedAt = now;
+    await job.save();
+    await writeAuditLog({
+      actorWalletId: job.ownerWalletId,
+      action: AUTOMATION_AUDIT_ACTIONS.jobFailed,
+      targetType: 'payment_job',
+      targetId: job.jobId,
+      metadata: { appId: job.appId, invoiceId: job.invoiceId, sessionId: job.sessionId, failureCode: failure.code }
+    });
+    return 'failed';
+  };
+
+  const invoice = await InvoiceModel.findOne({
+    invoiceId: job.invoiceId,
+    appId: job.appId,
+    ownerWalletId: job.ownerWalletId
+  });
+
+  if (!invoice) {
+    return failJob({ code: 'INVOICE_NOT_FOUND', message: 'Queued invoice no longer exists.' });
+  }
+
+  if (invoice.status === 'paid') {
+    job.status = 'succeeded';
+    job.succeededAt = new Date();
+    await job.save();
+    return 'succeeded';
+  }
+
+  if (invoice.status === 'cancelled') {
+    job.status = 'cancelled';
+    job.cancelledAt = new Date();
+    await job.save();
+    return 'cancelled';
+  }
+
+  try {
+    const app = await AppModel.findOne({ appId: job.appId, ownerWalletId: job.ownerWalletId }).lean<AppRecord>();
+    if (!app) {
+      throw new ApiError(404, 'APP_NOT_FOUND', 'Developer app was not found for this payment job.');
+    }
+
+    const fiberInvoice = ensureInvoicePaymentRequest(invoice.toObject());
+    const invoiceMetadata = toMetadata(invoice.metadata) ?? {};
+    const jobMetadata = toMetadata(job.metadata) ?? {};
+    const queuedByKeyId = typeof jobMetadata.queuedByKeyId === 'string' && jobMetadata.queuedByKeyId.trim()
+      ? jobMetadata.queuedByKeyId.trim()
+      : undefined;
+    invoice.status = 'processing';
+    invoice.processingAt = startedAt;
+    await invoice.save();
+    await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
+
+    await chargeSession({
+      sessionId: invoice.sessionId,
+      amount: fromMinorUnits(invoice.amountMinor, invoice.currency),
+      type: invoice.type ?? 'Invoice payment',
+      appId: invoice.appId,
+      apiKeyId: queuedByKeyId,
+      appServiceAddress: app.serviceAddress,
+      metadata: {
+        ...invoiceMetadata,
+        fiberInvoice,
+        automationInvoiceId: invoice.invoiceId,
+        automationJobId: job.jobId,
+        recipientId: invoice.recipientId,
+        batchId: invoice.batchId
+      }
+    });
+
+    const chargeAttempt = await ChargeAttemptModel.findOne({
+      sessionId: invoice.sessionId,
+      appId: invoice.appId,
+      'metadata.automationInvoiceId': invoice.invoiceId
+    }).sort({ createdAt: -1 }).lean<{ attemptId: string } | null>();
+
+    invoice.status = 'paid';
+    invoice.paidAt = new Date();
+    invoice.chargeAttemptId = chargeAttempt?.attemptId;
+    invoice.lastFailureCode = undefined;
+    invoice.lastFailureMessage = undefined;
+    await invoice.save();
+
+    job.status = 'succeeded';
+    job.succeededAt = new Date();
+    job.lastFailureCode = undefined;
+    job.lastFailureMessage = undefined;
+    await job.save();
+
+    await writeAuditLog({
+      actorWalletId: job.ownerWalletId,
+      action: AUTOMATION_AUDIT_ACTIONS.invoicePaid,
+      targetType: 'invoice',
+      targetId: invoice.invoiceId,
+      metadata: { appId: invoice.appId, sessionId: invoice.sessionId, jobId: job.jobId, chargeAttemptId: invoice.chargeAttemptId, workerId }
+    });
+    await writeAuditLog({
+      actorWalletId: job.ownerWalletId,
+      action: AUTOMATION_AUDIT_ACTIONS.jobSucceeded,
+      targetType: 'payment_job',
+      targetId: job.jobId,
+      metadata: { appId: job.appId, invoiceId: job.invoiceId, sessionId: job.sessionId, workerId }
+    });
+
+    await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
+    return 'succeeded';
+  } catch (error) {
+    const failure = failureFromError(error);
+    const chargeAttempt = await ChargeAttemptModel.findOne({
+      sessionId: invoice.sessionId,
+      appId: invoice.appId,
+      'metadata.automationInvoiceId': invoice.invoiceId
+    }).sort({ createdAt: -1 }).lean<{ attemptId: string } | null>();
+    invoice.status = 'failed';
+    invoice.failedAt = new Date();
+    invoice.chargeAttemptId = chargeAttempt?.attemptId ?? invoice.chargeAttemptId;
+    invoice.lastFailureCode = failure.code;
+    invoice.lastFailureMessage = failure.message;
+    await invoice.save();
+
+    await writeAuditLog({
+      actorWalletId: job.ownerWalletId,
+      action: AUTOMATION_AUDIT_ACTIONS.invoiceFailed,
+      targetType: 'invoice',
+      targetId: invoice.invoiceId,
+      metadata: { appId: invoice.appId, sessionId: invoice.sessionId, jobId: job.jobId, failureCode: failure.code }
+    });
+
+    const outcome = await failJob(failure);
+    if (invoice.batchId && isFatalPaymentJobError(failure.code)) {
+      await cancelBatchAfterFatalFailure(actor, invoice.batchId, failure);
+    } else {
+      await refreshPaymentBatchRollup(actor, invoice.batchId ?? undefined);
+    }
+    return outcome;
+  }
 }
 
 export async function listRecipients(actor: AutomationActor): Promise<{ recipients: RecipientDto[] }> {
@@ -583,5 +1035,95 @@ export async function createInvoiceBatch(actor: AutomationActor, input: CreateIn
   });
 
   return toPaymentBatchDto(batch.toObject(), invoices.map(toInvoiceDto));
+}
+
+export async function listPaymentBatches(actor: AutomationActor, sessionId?: string): Promise<{ batches: PaymentBatchDto[] }> {
+  await ensureActorApp(actor);
+  const batches = await PaymentBatchModel.find({
+    appId: actor.appId,
+    ownerWalletId: actor.ownerWalletId,
+    ...(sessionId ? { sessionId } : {})
+  }).sort({ createdAt: -1 }).limit(100).lean<(PaymentBatchRecord & { createdAt?: Date; updatedAt?: Date })[]>();
+
+  const batchIds = batches.map((batch) => batch.batchId);
+  const invoices = batchIds.length === 0
+    ? []
+    : await InvoiceModel.find({ batchId: { $in: batchIds }, appId: actor.appId, ownerWalletId: actor.ownerWalletId })
+        .sort({ createdAt: 1 })
+        .lean<(InvoiceRecord & { createdAt?: Date; updatedAt?: Date })[]>();
+
+  return {
+    batches: batches.map((batch) => toPaymentBatchDto(
+      batch,
+      invoices.filter((invoice) => invoice.batchId === batch.batchId).map(toInvoiceDto)
+    ))
+  };
+}
+
+export async function queueInvoice(actor: AutomationActor, invoiceId: string): Promise<InvoiceDto> {
+  await ensureActorApp(actor);
+  const invoice = await loadInvoiceForActor(actor, invoiceId);
+  await queueInvoiceDocument(actor, invoice);
+  return toInvoiceDto(invoice.toObject());
+}
+
+export async function queueInvoiceBatch(actor: AutomationActor, batchId: string): Promise<PaymentBatchDto> {
+  await ensureActorApp(actor);
+  const batch = await PaymentBatchModel.findOne({ batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId });
+  if (!batch) {
+    throw new ApiError(404, 'PAYMENT_BATCH_NOT_FOUND', 'Payment batch was not found for this app.');
+  }
+
+  if (batch.status === 'completed' || batch.status === 'cancelled') {
+    throw new ApiError(409, 'PAYMENT_BATCH_FINAL', 'Completed or cancelled batches cannot be queued again.');
+  }
+
+  const invoices = await InvoiceModel.find({ batchId, appId: actor.appId, ownerWalletId: actor.ownerWalletId }).sort({ createdAt: 1 });
+  if (invoices.length === 0) {
+    throw new ApiError(400, 'PAYMENT_BATCH_EMPTY', 'Payment batch has no invoices to queue.');
+  }
+
+  const missingInvoice = invoices.find((invoice) => invoice.status !== 'paid' && invoice.status !== 'cancelled' && !normalizeFiberInvoice(invoice.fiberInvoice ?? undefined));
+  if (missingInvoice) {
+    throw new ApiError(400, 'FIBER_INVOICE_REQUIRED', 'Every queued batch invoice must include a Fiber invoice/payment request.');
+  }
+
+  batch.status = 'queued';
+  batch.queuedAt = batch.queuedAt ?? new Date();
+  await batch.save();
+
+  for (const invoice of invoices) {
+    if (invoice.status !== 'paid' && invoice.status !== 'cancelled') {
+      await queueInvoiceDocument(actor, invoice);
+    }
+  }
+
+  await refreshPaymentBatchRollup(actor, batchId);
+  await writeAuditLog({
+    actorWalletId: actor.ownerWalletId,
+    action: AUTOMATION_AUDIT_ACTIONS.batchQueued,
+    targetType: 'payment_batch',
+    targetId: batchId,
+    metadata: auditMetadata(actor, { invoiceCount: invoices.length, sessionId: batch.sessionId })
+  });
+
+  return loadBatchDto(actor, batchId);
+}
+
+export async function runPaymentWorkerOnce(options: RunPaymentWorkerOptions = {}): Promise<PaymentWorkerRunResult> {
+  const workerId = normalizePaymentWorkerId(options.workerId);
+  const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 10)));
+  const result: PaymentWorkerRunResult = { processed: 0, succeeded: 0, failed: 0, retried: 0, cancelled: 0 };
+
+  for (let index = 0; index < limit; index += 1) {
+    const job = await lockNextPaymentJob(workerId);
+    if (!job) break;
+
+    const outcome = await processPaymentJob(job, workerId);
+    result.processed += 1;
+    result[outcome] += 1;
+  }
+
+  return result;
 }
 
