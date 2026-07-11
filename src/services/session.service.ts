@@ -9,10 +9,26 @@ import { WalletFundingModel } from '../models/walletFunding.model.js';
 import { WalletModel, type WalletRecord } from '../models/wallet.model.js';
 import { writeAuditLog } from './audit.service.js';
 import { fiberProvider } from './fiberProvider.js';
+import { deriveVaultForWallet } from './vault.service.js';
+import { executeVaultPayout, getVaultPayoutReadiness } from './vaultPayout.service.js';
 
 const LEGACY_PLACEHOLDER_BALANCE_MINOR = toMinorUnits('1240.50', 'USDC');
 const HISTORY_STATUSES: SessionStatus[] = ['settled', 'revoked', 'expired'];
 const OPEN_STATUSES: SessionStatus[] = ['active', 'paused'];
+const MIN_FIBER_PAYMENT_REQUEST_LENGTH = 16;
+const PAYOUT_PROCESSING_STALE_MS = 60000;
+const PAYOUT_RETRY_BACKOFF_MS = 60000;
+const RETRYABLE_VAULT_TX_FAILURE_PATTERN = 'InvalidInstruction|TransactionFailedToVerify|TransactionFailedToResolve|Resolve failed Unknown|PoolRejectedRBF';
+const RETRYABLE_VAULT_CONFIG_FAILURE_CODES = [
+  'VAULT_PAYOUT_SIGNER_NOT_CONFIGURED',
+  'VAULT_CELL_DEP_NOT_CONFIGURED',
+  'VAULT_PAYOUT_NOT_CONFIGURED',
+  'VAULT_OPERATOR_SIGNER_MISMATCH',
+  'VAULT_PAYOUT_NOT_READY',
+  'VAULT_LIVE_CELLS_NOT_FOUND',
+  'VAULT_LIVE_CAPACITY_INSUFFICIENT',
+  'OPERATOR_FEE_CAPACITY_INSUFFICIENT'
+] as const;
 
 export const CREATE_SESSION_POLICY = {
   minLimit: 0.01,
@@ -53,6 +69,15 @@ interface TransactionLogDto {
 export interface RecipientWalletDto {
   name: string;
   address: string;
+  amount?: number;
+  amountMinor?: number;
+  fiberInvoice?: string;
+  status?: 'pending' | 'processing' | 'paid' | 'failed';
+  chargeAttemptId?: string;
+  paidAt?: string | Date;
+  lastAttemptAt?: string | Date;
+  lastFailureCode?: string;
+  lastFailureMessage?: string;
 }
 
 export interface ChargeAttemptDto {
@@ -483,6 +508,15 @@ function cleanOptionalString(value?: string): string | undefined {
   return cleaned ? cleaned : undefined;
 }
 
+function validateFiberPaymentRequest(value?: string): string | undefined {
+  const request = cleanOptionalString(value);
+  if (!request) return undefined;
+  if (request.length < MIN_FIBER_PAYMENT_REQUEST_LENGTH || /\s/.test(request)) {
+    throw new ApiError(400, 'INVALID_FIBER_PAYMENT_REQUEST', 'Enter a full Fiber invoice/payment request; short placeholders cannot be paid.');
+  }
+  return request;
+}
+
 function normalizePaymentPurpose(value?: PaymentPurpose): PaymentPurpose {
   return value && isValidPaymentPurpose(value) ? value : 'app_session';
 }
@@ -501,7 +535,7 @@ function normalizeReleaseCadence(value: ReleaseCadence | undefined, purpose: Pay
 }
 
 function validateNextReleaseAt(value: string | undefined, purpose: PaymentPurpose, expiryAt?: Date): Date | undefined {
-  const requiresDate = purpose === 'scheduled_release' || purpose === 'recurring_release';
+  const requiresDate = purpose === 'subscription' || purpose === 'scheduled_release' || purpose === 'recurring_release';
   const cleaned = cleanOptionalString(value);
   if (!cleaned) {
     if (requiresDate) {
@@ -532,15 +566,22 @@ function normalizeRecipientWallets(input: {
   recipientAddress?: string;
   recipientWallets?: RecipientWalletDto[];
 }): RecipientWalletDto[] {
-  const requiresRecipient = input.purpose === 'scheduled_release' || input.purpose === 'recurring_release';
+  const requiresRecipient = input.purpose === 'subscription' || input.purpose === 'scheduled_release' || input.purpose === 'recurring_release';
   const candidates = (input.recipientWallets ?? [])
-    .map((wallet) => ({ name: cleanOptionalString(wallet.name) ?? '', address: cleanOptionalString(wallet.address) ?? '' }))
-    .filter((wallet) => wallet.name || wallet.address);
+    .map((wallet) => ({
+      name: cleanOptionalString(wallet.name) ?? '',
+      address: cleanOptionalString(wallet.address) ?? '',
+      amount: wallet.amount,
+      amountMinor: wallet.amountMinor,
+      fiberInvoice: validateFiberPaymentRequest(wallet.fiberInvoice),
+      status: wallet.status ?? 'pending' as const
+    }))
+    .filter((wallet) => wallet.name || wallet.address || wallet.amount != null || wallet.fiberInvoice);
 
   const legacyName = cleanOptionalString(input.recipientName);
   const legacyAddress = cleanOptionalString(input.recipientAddress);
   if (candidates.length === 0 && (legacyName || legacyAddress)) {
-    candidates.push({ name: legacyName ?? 'Recipient', address: legacyAddress ?? '' });
+    candidates.push({ name: legacyName ?? 'Recipient', address: legacyAddress ?? '', amount: undefined, amountMinor: undefined, fiberInvoice: undefined, status: 'pending' as const });
   }
 
   if (requiresRecipient && candidates.length === 0) {
@@ -560,12 +601,23 @@ function normalizeRecipientWallets(input: {
     if (!isFiberCkbAddress(wallet.address)) {
       throw new ApiError(400, 'INVALID_RECIPIENT_ADDRESS', FIBER_CKB_ADDRESS_ERROR);
     }
+    const amountMinor = wallet.amountMinor ?? (wallet.amount == null ? undefined : toMinorUnits(String(wallet.amount), CREATE_SESSION_POLICY.currency));
+    if (requiresRecipient && (amountMinor == null || amountMinor <= 0)) {
+      throw new ApiError(400, 'RECIPIENT_AMOUNT_REQUIRED', 'Each scheduled payout recipient needs a payout amount.');
+    }
     const normalizedAddress = wallet.address.toLowerCase();
     if (seen.has(normalizedAddress)) {
       throw new ApiError(400, 'DUPLICATE_RECIPIENT_WALLET', 'Recipient wallet addresses must be unique in a payment rule.');
     }
     seen.add(normalizedAddress);
-    wallets.push(wallet);
+    wallets.push({
+      name: wallet.name,
+      address: wallet.address,
+      amount: amountMinor == null ? undefined : fromMinorUnits(amountMinor, CREATE_SESSION_POLICY.currency),
+      amountMinor,
+      fiberInvoice: wallet.fiberInvoice,
+      status: wallet.status ?? 'pending'
+    });
   }
 
   return wallets;
@@ -614,10 +666,10 @@ function buildSessionChargePolicy(input: {
   }
   if (input.purpose === 'scheduled_release') {
     const recipient = input.recipientCount && input.recipientCount > 1 ? ' to ' + input.recipientCount + ' wallets' : input.recipientName ? ' to ' + input.recipientName : '';
-    return 'Reserved funds auto-release once' + recipient + ' on the scheduled date after invoice validation.';
+    return 'Reserved funds auto-release once' + recipient + ' on the scheduled date through the FiberPass vault.';
   }
   const recipient = input.recipientCount && input.recipientCount > 1 ? ' to ' + input.recipientCount + ' wallets' : input.recipientName ? ' to ' + input.recipientName : '';
-  return 'Recurring reserved funds auto-release ' + cadenceLabel(input.releaseCadence) + recipient + ' after invoice validation.';
+  return 'Recurring reserved funds auto-release ' + cadenceLabel(input.releaseCadence) + recipient + ' through the FiberPass vault.';
 }
 
 function metadataString(metadata: Record<string, unknown> | undefined, ...keys: string[]): string | undefined {
@@ -696,6 +748,47 @@ export function walletIdFromAddress(address: string): string {
   return address.toLowerCase();
 }
 
+async function reconcileWalletBalanceWithCurrentVault(walletId: string): Promise<void> {
+  const vault = deriveVaultForWallet({ walletId });
+  if (!vault) {
+    await ensureWalletMoneyFields(walletId);
+    return;
+  }
+
+  const [fundingRecords, openSessions] = await Promise.all([
+    WalletFundingModel.find({
+      walletId,
+      status: 'confirmed',
+      depositMode: 'vault',
+      vaultScriptHash: vault.scriptHash
+    }).select('amount amountMinor currency').lean<Array<{ amount?: number | null; amountMinor?: number | null; currency?: string | null }>>(),
+    SessionModel.find({
+      ownerWalletId: walletId,
+      status: { $in: OPEN_STATUSES }
+    }).select('limit limitMinor spent spentMinor currency').lean<Array<{ limit?: number | null; limitMinor?: number | null; spent?: number | null; spentMinor?: number | null; currency?: string | null }>>()
+  ]);
+
+  const fundedMinor = fundingRecords.reduce((total, funding) => total + fallbackMinorUnits(funding.amountMinor, funding.amount, funding.currency ?? CREATE_SESSION_POLICY.currency), 0);
+  const reservedMinor = openSessions.reduce((total, session) => {
+    const currency = session.currency ?? CREATE_SESSION_POLICY.currency;
+    const limitMinor = fallbackMinorUnits(session.limitMinor, session.limit, currency);
+    const spentMinor = fallbackMinorUnits(session.spentMinor, session.spent, currency);
+    return total + clampMinorUnits(limitMinor - spentMinor);
+  }, 0);
+  const availableMinor = clampMinorUnits(fundedMinor - reservedMinor);
+
+  await WalletModel.updateOne(
+    { walletId },
+    {
+      $set: {
+        currency: CREATE_SESSION_POLICY.currency,
+        balanceMinor: availableMinor,
+        balance: fromMinorUnits(availableMinor, CREATE_SESSION_POLICY.currency)
+      }
+    }
+  );
+}
+
 async function ensureWalletMoneyFields(walletId: string): Promise<void> {
   const wallet = await WalletModel.findOne({ walletId });
   if (!wallet) return;
@@ -749,19 +842,17 @@ export async function ensureWalletForAddress(address: string): Promise<WalletRec
     throw new ApiError(404, 'WALLET_NOT_FOUND', 'Connect with JoyID before loading FiberPass sessions.');
   }
 
-  const walletObject = currentWallet.toObject();
-  const balanceMinor = walletBalanceMinor(walletObject);
-  if (walletObject.balanceMinor !== balanceMinor) {
-    currentWallet.balanceMinor = balanceMinor;
-    currentWallet.balance = fromMinorUnits(balanceMinor, currentWallet.currency);
-    await currentWallet.save();
+  await reconcileWalletBalanceWithCurrentVault(walletId);
+  const reconciledWallet = await WalletModel.findOne({ walletId });
+  if (!reconciledWallet) {
+    throw new ApiError(404, 'WALLET_NOT_FOUND', 'Connect with JoyID before loading FiberPass sessions.');
   }
 
-  return currentWallet.toObject();
+  return reconciledWallet.toObject();
 }
 
 async function getWalletDocument(walletId: string) {
-  await ensureWalletMoneyFields(walletId);
+  await reconcileWalletBalanceWithCurrentVault(walletId);
   await resetUntouchedLegacyPlaceholderBalance(walletId);
   const wallet = await WalletModel.findOne({ walletId });
   if (!wallet) {
@@ -882,7 +973,7 @@ export async function createSession(input: CreateSessionInput, walletId: string)
     throw new ApiError(400, 'APP_NOT_VERIFIED', 'Selected app is not available for FiberPass sessions.');
   }
 
-  await ensureWalletMoneyFields(walletId);
+  await reconcileWalletBalanceWithCurrentVault(walletId);
 
   const expiryAt = validateExpiryAt(input.expiryAt);
   const paymentPurpose = normalizePaymentPurpose(input.paymentPurpose);
@@ -995,7 +1086,7 @@ export async function topUpSession(publicId: string, walletId: string, amount = 
     throw new ApiError(409, 'SESSION_CLOSED', 'Only active or paused sessions can be topped up.');
   }
 
-  await ensureWalletMoneyFields(walletId);
+  await reconcileWalletBalanceWithCurrentVault(walletId);
   const topUpAmount = fromMinorUnits(topUpMinor, session.currency);
   const wallet = await WalletModel.findOneAndUpdate(
     { walletId, balanceMinor: { $gte: topUpMinor } },
@@ -1157,6 +1248,7 @@ export async function chargeSession(input: ChargeSessionInput): Promise<Sessions
     const sessionObject = session.toObject();
     const spentMinor = sessionSpentMinor(sessionObject);
     const limitMinor = sessionLimitMinor(sessionObject);
+    const isScheduledPayout = input.metadata?.scheduledPayout === true;
     attempt.ownerWalletId = ownerWalletId;
     attempt.currency = currency;
     attempt.amount = fromMinorUnits(amountMinor, currency);
@@ -1175,7 +1267,7 @@ export async function chargeSession(input: ChargeSessionInput): Promise<Sessions
     }
 
     const expiryAt = session.expiryAt instanceof Date ? session.expiryAt : undefined;
-    if (expiryAt && expiryAt.getTime() <= Date.now()) {
+    if (expiryAt && expiryAt.getTime() <= Date.now() && !isScheduledPayout) {
       session.status = 'expired';
       session.fiberStatus = 'expired';
       session.expiryTime = 'Expired';
@@ -1208,24 +1300,39 @@ export async function chargeSession(input: ChargeSessionInput): Promise<Sessions
 
     assertChargeAllowedBySessionRules(session.toObject() as SessionRecord, input, amountMinor);
 
-    const fiberInvoice = typeof input.metadata?.fiberInvoice === 'string' ? input.metadata.fiberInvoice.trim() : '';
-    if (!fiberInvoice) {
-      throw new ApiError(400, 'FIBER_INVOICE_REQUIRED', 'A Fiber invoice/payment request is required before an app can charge this FiberPass.');
-    }
-
-    let charge;
-    try {
-      charge = await fiberProvider.authorizeCharge({
+    const directVaultPayout = input.metadata?.directVaultPayout === true;
+    let charge: { provider: string; network: string; proofId: string };
+    if (directVaultPayout) {
+      const recipientAddress = metadataString(input.metadata, 'recipientAddress', 'recipientServiceAddress', 'payeeAddress');
+      if (!recipientAddress) {
+        throw new ApiError(400, 'RECIPIENT_ADDRESS_REQUIRED', 'Direct vault payout requires a recipient CKB address.');
+      }
+      charge = await executeVaultPayout({
+        ownerWalletId,
         sessionId: input.sessionId,
-        networkSessionId: session.fiberSessionId ?? undefined,
-        appAddress: session.serviceAddress,
+        recipientAddress,
         amountMinor,
-        currency,
-        paymentRequest: fiberInvoice,
-        metadata: input.metadata
+        currency
       });
-    } catch (error) {
-      throw fiberProviderFailure(error, 'FIBER_PAYMENT_FAILED', 'Fiber payment failed.');
+    } else {
+      const fiberInvoice = typeof input.metadata?.fiberInvoice === 'string' ? input.metadata.fiberInvoice.trim() : '';
+      if (!fiberInvoice) {
+        throw new ApiError(400, 'FIBER_INVOICE_REQUIRED', 'A Fiber invoice/payment request is required before an app can charge this FiberPass.');
+      }
+
+      try {
+        charge = await fiberProvider.authorizeCharge({
+          sessionId: input.sessionId,
+          networkSessionId: session.fiberSessionId ?? undefined,
+          appAddress: session.serviceAddress,
+          amountMinor,
+          currency,
+          paymentRequest: fiberInvoice,
+          metadata: input.metadata
+        });
+      } catch (error) {
+        throw fiberProviderFailure(error, 'FIBER_PAYMENT_FAILED', 'Fiber payment failed.');
+      }
     }
 
     const nextSpentMinor = spentMinor + amountMinor;
@@ -1268,7 +1375,7 @@ export async function chargeSession(input: ChargeSessionInput): Promise<Sessions
     } else {
       session.fiberStatus = 'active';
       const recipientWalletCount = Array.isArray(session.recipientWallets) ? session.recipientWallets.length : 0;
-      const canAdvanceReleaseDate = session.paymentPurpose !== 'recurring_release' || recipientWalletCount <= 1;
+      const canAdvanceReleaseDate = !isScheduledPayout && (session.paymentPurpose !== 'recurring_release' || recipientWalletCount <= 1);
       const advancedReleaseAt = canAdvanceReleaseDate
         ? advanceReleaseDate(
             session.nextReleaseAt instanceof Date ? session.nextReleaseAt : undefined,
@@ -1305,6 +1412,272 @@ export async function chargeSession(input: ChargeSessionInput): Promise<Sessions
     await attempt.save().catch(() => undefined);
     throw publicError;
   }
+}
+
+
+interface DueSessionPayoutWorkerInput {
+  limit?: number;
+}
+
+export interface DueSessionPayoutWorkerResult {
+  scanned: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+}
+
+function dueWalletAmountMinor(wallet: RecipientWalletDto, currency: string): number {
+  return fallbackMinorUnits(wallet.amountMinor, wallet.amount, currency);
+}
+
+function isRetryableVaultConfigFailure(code?: string): boolean {
+  return !!code && (RETRYABLE_VAULT_CONFIG_FAILURE_CODES as readonly string[]).includes(code);
+}
+
+function isRetryableVaultTxFailure(code?: string, message?: string): boolean {
+  return code === 'VAULT_PAYOUT_TX_FAILED' && new RegExp(RETRYABLE_VAULT_TX_FAILURE_PATTERN).test(message ?? '');
+}
+
+function isRetryableVaultFailure(wallet: RecipientWalletDto): boolean {
+  return isRetryableVaultConfigFailure(wallet.lastFailureCode) || isRetryableVaultTxFailure(wallet.lastFailureCode, wallet.lastFailureMessage);
+}
+
+function isRetryBackoffElapsed(wallet: RecipientWalletDto, nowMs = Date.now()): boolean {
+  if (!wallet.lastAttemptAt) return true;
+  const lastAttemptMs = new Date(wallet.lastAttemptAt).getTime();
+  return Number.isFinite(lastAttemptMs) && lastAttemptMs <= nowMs - PAYOUT_RETRY_BACKOFF_MS;
+}
+
+function isStaleProcessingPayout(wallet: RecipientWalletDto, nowMs = Date.now()): boolean {
+  if (wallet.status !== "processing" || !wallet.lastAttemptAt) return false;
+  const lastAttemptMs = new Date(wallet.lastAttemptAt).getTime();
+  return Number.isFinite(lastAttemptMs) && lastAttemptMs <= nowMs - PAYOUT_PROCESSING_STALE_MS;
+}
+
+function isPayoutRecipientProcessable(wallet: RecipientWalletDto): boolean {
+  return !wallet.status || wallet.status === 'pending' || (wallet.status === 'failed' && isRetryableVaultFailure(wallet) && isRetryBackoffElapsed(wallet)) || isStaleProcessingPayout(wallet);
+}
+
+async function claimRecipientWalletForPayout(input: { sessionId: string; index: number; staleBefore: Date; retryBefore: Date }): Promise<boolean> {
+  const statusPath = "recipientWallets." + input.index + ".status";
+  const failureCodePath = "recipientWallets." + input.index + ".lastFailureCode";
+  const failureMessagePath = "recipientWallets." + input.index + ".lastFailureMessage";
+  const lastAttemptPath = "recipientWallets." + input.index + ".lastAttemptAt";
+  const result = await SessionModel.updateOne(
+    {
+      publicId: input.sessionId,
+      $or: [
+        { [statusPath]: "pending" },
+        { [statusPath]: { $exists: false } },
+        { [statusPath]: 'failed', [failureCodePath]: { $in: RETRYABLE_VAULT_CONFIG_FAILURE_CODES }, $or: [{ [lastAttemptPath]: { $lte: input.retryBefore } }, { [lastAttemptPath]: { $exists: false } }] },
+        { [statusPath]: 'failed', [failureCodePath]: 'VAULT_PAYOUT_TX_FAILED', [failureMessagePath]: { $regex: RETRYABLE_VAULT_TX_FAILURE_PATTERN }, $or: [{ [lastAttemptPath]: { $lte: input.retryBefore } }, { [lastAttemptPath]: { $exists: false } }] },
+        { [statusPath]: "processing", [lastAttemptPath]: { $lte: input.staleBefore } }
+      ]
+    },
+    {
+      $set: {
+        [statusPath]: "processing",
+        ["recipientWallets." + input.index + ".lastAttemptAt"]: new Date()
+      },
+      $unset: {
+        ["recipientWallets." + input.index + ".lastFailureCode"]: 1,
+        ["recipientWallets." + input.index + ".lastFailureMessage"]: 1
+      }
+    }
+  );
+  return result.modifiedCount === 1;
+}
+
+async function markRecipientWalletFailure(input: {
+  sessionId: string;
+  index: number;
+  failure: { code: string; message: string };
+  chargeAttemptId?: string;
+}): Promise<void> {
+  const setFields: Record<string, unknown> = {
+    ['recipientWallets.' + input.index + '.status']: 'failed',
+    ['recipientWallets.' + input.index + '.lastAttemptAt']: new Date(),
+    ['recipientWallets.' + input.index + '.lastFailureCode']: input.failure.code,
+    ['recipientWallets.' + input.index + '.lastFailureMessage']: input.failure.message
+  };
+  if (input.chargeAttemptId) {
+    setFields['recipientWallets.' + input.index + '.chargeAttemptId'] = input.chargeAttemptId;
+  }
+
+  await SessionModel.updateOne(
+    { publicId: input.sessionId },
+    { $set: setFields }
+  );
+}
+
+async function markRecipientWalletPaid(input: {
+  sessionId: string;
+  index: number;
+  chargeAttemptId?: string;
+}): Promise<void> {
+  await SessionModel.updateOne(
+    { publicId: input.sessionId },
+    {
+      $set: {
+        ['recipientWallets.' + input.index + '.status']: 'paid',
+        ['recipientWallets.' + input.index + '.paidAt']: new Date(),
+        ['recipientWallets.' + input.index + '.lastAttemptAt']: new Date(),
+        ['recipientWallets.' + input.index + '.chargeAttemptId']: input.chargeAttemptId
+      },
+      $unset: {
+        ['recipientWallets.' + input.index + '.lastFailureCode']: 1,
+        ['recipientWallets.' + input.index + '.lastFailureMessage']: 1
+      }
+    }
+  );
+}
+
+async function latestScheduledPayoutAttempt(sessionId: string, recipientAddress: string): Promise<string | undefined> {
+  const attempt = await ChargeAttemptModel.findOne({
+    sessionId,
+    'metadata.scheduledPayout': true,
+    'metadata.recipientAddress': recipientAddress
+  }).sort({ createdAt: -1 }).lean<ChargeAttemptLike | null>();
+  return attempt?.attemptId;
+}
+
+async function finalizePayoutCycleIfComplete(sessionId: string, walletId: string): Promise<void> {
+  const session = await SessionModel.findOne({ publicId: sessionId });
+  if (!session || session.status !== 'active') return;
+  const wallets = (session.recipientWallets ?? []) as RecipientWalletDto[];
+  if (wallets.length === 0 || wallets.some((wallet) => wallet.status !== 'paid')) return;
+
+  if (session.paymentPurpose === 'subscription' || session.paymentPurpose === 'recurring_release') {
+    const nextReleaseAt = advanceReleaseDate(
+      session.nextReleaseAt instanceof Date ? session.nextReleaseAt : undefined,
+      session.releaseCadence as ReleaseCadence | undefined
+    );
+    const expiryAt = session.expiryAt instanceof Date ? session.expiryAt : undefined;
+    if (nextReleaseAt && (!expiryAt || nextReleaseAt.getTime() < expiryAt.getTime())) {
+      session.nextReleaseAt = nextReleaseAt;
+      session.set('recipientWallets', wallets.map((wallet) => ({
+        name: wallet.name,
+        address: wallet.address,
+        amount: wallet.amount,
+        amountMinor: wallet.amountMinor,
+        fiberInvoice: wallet.fiberInvoice,
+        status: 'pending'
+      })));
+      prependLogs(session, newLog('Recurring Payout Cycle Completed'));
+      await session.save();
+      await writeAuditLog({ actorWalletId: walletId, action: 'session.recurring_cycle_completed', targetType: 'session', targetId: sessionId, metadata: { nextReleaseAt } });
+      return;
+    }
+  }
+
+  await settleSession(sessionId, walletId).catch(() => undefined);
+}
+
+export async function runDueSessionPayouts(input: DueSessionPayoutWorkerInput = {}): Promise<DueSessionPayoutWorkerResult> {
+  const limit = Math.min(Math.max(input.limit ?? 10, 1), 100);
+  const vaultReadiness = getVaultPayoutReadiness();
+  const staleBefore = new Date(Date.now() - PAYOUT_PROCESSING_STALE_MS);
+  const retryBefore = new Date(Date.now() - PAYOUT_RETRY_BACKOFF_MS);
+  const recipientStatusFilters: Record<string, unknown>[] = [
+    { status: "pending" },
+    { status: { $exists: false } }
+  ];
+  if (vaultReadiness.ready) {
+    recipientStatusFilters.push(
+      { status: 'failed', lastFailureCode: { $in: RETRYABLE_VAULT_CONFIG_FAILURE_CODES }, $or: [{ lastAttemptAt: { $lte: retryBefore } }, { lastAttemptAt: { $exists: false } }] },
+      { status: 'failed', lastFailureCode: 'VAULT_PAYOUT_TX_FAILED', lastFailureMessage: { $regex: RETRYABLE_VAULT_TX_FAILURE_PATTERN }, $or: [{ lastAttemptAt: { $lte: retryBefore } }, { lastAttemptAt: { $exists: false } }] },
+      { status: "processing", lastAttemptAt: { $lte: staleBefore } }
+    );
+  }
+
+  const dueSessions = await SessionModel.find({
+    status: "active",
+    paymentPurpose: { $in: ["subscription", "scheduled_release", "recurring_release"] },
+    nextReleaseAt: { $lte: new Date() },
+    recipientWallets: {
+      $elemMatch: {
+        $or: recipientStatusFilters
+      }
+    }
+  }).sort({ nextReleaseAt: 1, createdAt: 1 }).limit(limit);
+
+  const result: DueSessionPayoutWorkerResult = {
+    scanned: dueSessions.length,
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0
+  };
+
+  if (!vaultReadiness.ready) {
+    result.skipped = dueSessions.reduce((count, session) => {
+      const wallets = ((session.toObject() as SessionRecord).recipientWallets ?? []) as RecipientWalletDto[];
+      return count + wallets.filter(isPayoutRecipientProcessable).length;
+    }, 0);
+    return result;
+  }
+
+  for (const session of dueSessions) {
+    const sessionObject = session.toObject() as SessionRecord;
+    const wallets = [...(sessionObject.recipientWallets ?? [])] as RecipientWalletDto[];
+    if (wallets.length === 0) {
+      result.skipped += 1;
+      continue;
+    }
+
+    for (const [index, wallet] of wallets.entries()) {
+      if (!isPayoutRecipientProcessable(wallet)) continue;
+      const claimed = await claimRecipientWalletForPayout({ sessionId: session.publicId, index, staleBefore, retryBefore });
+      if (!claimed) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.processed += 1;
+      const amountMinor = dueWalletAmountMinor(wallet, session.currency);
+      if (amountMinor <= 0) {
+        const failure = {
+          code: "RECIPIENT_AMOUNT_REQUIRED",
+          message: "Scheduled payout recipient is missing an amount."
+        };
+        await markRecipientWalletFailure({ sessionId: session.publicId, index, failure });
+        result.failed += 1;
+        continue;
+      }
+
+      try {
+        await chargeSession({
+          sessionId: session.publicId,
+          amount: fromMinorUnits(amountMinor, session.currency),
+          type: "Scheduled payout: " + wallet.name,
+          appId: session.appId ?? undefined,
+          appServiceAddress: session.serviceAddress,
+          metadata: {
+            scheduledPayout: true,
+            directVaultPayout: true,
+            payoutRail: "ckb_vault",
+            recipientName: wallet.name,
+            recipientAddress: wallet.address,
+            paymentReference: session.paymentReference,
+            paymentPurpose: session.paymentPurpose
+          }
+        });
+        const chargeAttemptId = await latestScheduledPayoutAttempt(session.publicId, wallet.address);
+        await markRecipientWalletPaid({ sessionId: session.publicId, index, chargeAttemptId: chargeAttemptId ?? undefined });
+        result.succeeded += 1;
+      } catch (error) {
+        const chargeAttemptId = await latestScheduledPayoutAttempt(session.publicId, wallet.address);
+        await markRecipientWalletFailure({ sessionId: session.publicId, index, failure: failureFromError(error), chargeAttemptId });
+        result.failed += 1;
+      }
+    }
+
+    await finalizePayoutCycleIfComplete(session.publicId, session.ownerWalletId as string);
+    await publishOverview(session.ownerWalletId as string).catch(() => undefined);
+  }
+
+  return result;
 }
 
 export function isValidIconType(iconType: string): iconType is IconType {

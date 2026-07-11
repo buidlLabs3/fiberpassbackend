@@ -13,6 +13,7 @@ import { appsRouter } from './routes/apps.routes.js';
 import { authRouter } from './routes/auth.routes.js';
 import { sessionsRouter } from './routes/sessions.routes.js';
 import { walletRouter } from './routes/wallet.routes.js';
+import { runDueSessionPayouts } from './services/session.service.js';
 
 function parseCorsOrigin(origin: string): boolean | string[] {
   if (origin === '*') return true;
@@ -37,6 +38,33 @@ function sendMeta(_request: Request, response: Response): void {
       rpcConfigured: Boolean(env.FIBER_RPC_URL)
     }
   });
+}
+
+let paymentSchedulerRunning = false;
+let paymentSchedulerTimer: NodeJS.Timeout | undefined;
+
+async function runEmbeddedPaymentSchedulerTick(): Promise<void> {
+  if (paymentSchedulerRunning) return;
+  paymentSchedulerRunning = true;
+  try {
+    const scheduledPayouts = await runDueSessionPayouts({ limit: env.PAYMENT_WORKER_BATCH_SIZE });
+    if (scheduledPayouts.processed > 0 || scheduledPayouts.failed > 0) {
+      logger.info('api_scheduled_payouts_processed', { ...scheduledPayouts });
+    }
+  } catch (error) {
+    logger.error('api_scheduled_payouts_failed', { error });
+  } finally {
+    paymentSchedulerRunning = false;
+  }
+}
+
+function startEmbeddedPaymentScheduler(): void {
+  if (paymentSchedulerTimer) return;
+  paymentSchedulerTimer = setInterval(() => {
+    void runEmbeddedPaymentSchedulerTick();
+  }, env.PAYMENT_WORKER_INTERVAL_MS);
+  paymentSchedulerTimer.unref?.();
+  void runEmbeddedPaymentSchedulerTick();
 }
 
 app.get('/meta', sendMeta);
@@ -96,9 +124,11 @@ await mongoose.connect(env.MONGODB_URI);
 const server = http.createServer(app);
 server.listen(env.PORT, '0.0.0.0', () => {
   logger.info('api_listening', { port: env.PORT, fiberProvider: env.FIBER_PROVIDER, fiberNetwork: env.FIBER_NETWORK });
+  startEmbeddedPaymentScheduler();
 });
 
 const shutdown = async () => {
+  if (paymentSchedulerTimer) clearInterval(paymentSchedulerTimer);
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });

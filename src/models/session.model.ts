@@ -26,7 +26,16 @@ const transactionLogSchema = new Schema(
 const recipientWalletSchema = new Schema(
   {
     name: { type: String, required: true, trim: true },
-    address: { type: String, required: true, trim: true }
+    address: { type: String, required: true, trim: true },
+    amount: { type: Number, min: 0 },
+    amountMinor: { type: Number, min: 1 },
+    fiberInvoice: { type: String, trim: true },
+    status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' },
+    chargeAttemptId: { type: String, trim: true },
+    paidAt: { type: Date },
+    lastAttemptAt: { type: Date },
+    lastFailureCode: { type: String, trim: true },
+    lastFailureMessage: { type: String, trim: true }
   },
   { _id: false }
 );

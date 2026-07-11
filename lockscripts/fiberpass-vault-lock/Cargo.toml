@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-ckb-std = { version = "0.16.4", default-features = false, features = ["allocator", "ckb-types"] }
+ckb-std = { version = "0.16.4", default-features = false, features = ["allocator", "dummy-atomic"] }
 
 [features]
 default = []

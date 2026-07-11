@@ -9,9 +9,13 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const crateDir = resolve(scriptDir, '..');
 const binaryPath = resolve(crateDir, 'target/riscv64imac-unknown-none-elf/release/fiberpass-vault-lock');
 
+const env = { ...process.env };
+env.RUSTFLAGS = [env.RUSTFLAGS, '-C target-feature=-a'].filter(Boolean).join(' ');
+
 const build = spawnSync('cargo', ['build', '--release', '--target', 'riscv64imac-unknown-none-elf'], {
   cwd: crateDir,
-  stdio: 'inherit'
+  stdio: 'inherit',
+  env
 });
 
 if (build.status !== 0) {

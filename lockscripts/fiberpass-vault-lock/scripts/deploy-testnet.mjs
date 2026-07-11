@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import 'dotenv/config';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +29,18 @@ function readWallet() {
   };
 }
 
+function readExistingDeployment() {
+  const outputFile = process.env.FIBERPASS_DEPLOYMENT_OUTPUT_FILE || defaultOutputFile;
+  if (!existsSync(outputFile)) {
+    throw new Error('Existing deployment file was not found: ' + outputFile);
+  }
+  const deployment = JSON.parse(readFileSync(outputFile, 'utf8'));
+  if (!deployment.typeId) {
+    throw new Error('Existing deployment file is missing typeId.');
+  }
+  return deployment;
+}
+
 function readBinary() {
   if (!existsSync(binaryPath)) {
     throw new Error('Build the release binary first with npm run vault:build');
@@ -39,6 +52,9 @@ async function main() {
   const rpcUrl = requiredEnv('CKB_TESTNET_RPC_URL');
   const indexerUrl = process.env.CKB_TESTNET_INDEXER_URL || rpcUrl;
   const broadcast = process.env.BROADCAST !== 'false';
+  const requestedMode = process.env.FIBERPASS_VAULT_DEPLOY_MODE || '';
+  const upgradeExisting = process.env.FIBERPASS_VAULT_UPGRADE === 'true' || requestedMode === 'type-id-upgrade';
+  const deployMode = requestedMode || (upgradeExisting ? 'type-id-upgrade' : 'type-id');
   const { walletFile, wallet } = readWallet();
   const scriptBinary = readBinary();
 
@@ -48,12 +64,28 @@ async function main() {
 
   const indexer = new Indexer(indexerUrl, rpcUrl);
   const rpc = new RPC(rpcUrl);
-  const deployResult = await commons.deploy.generateDeployWithTypeIdTx({
-    cellProvider: indexer,
-    scriptBinary,
-    fromInfo: wallet.address,
-    config: config.TESTNET
-  });
+  const existingDeployment = upgradeExisting ? readExistingDeployment() : undefined;
+  const deployResult = deployMode === 'data2'
+    ? await commons.deploy.generateDeployWithDataTx({
+        cellProvider: indexer,
+        scriptBinary,
+        fromInfo: wallet.address,
+        config: config.TESTNET
+      })
+    : upgradeExisting
+      ? await commons.deploy.generateUpgradeTypeIdDataTx({
+          cellProvider: indexer,
+          scriptBinary,
+          fromInfo: wallet.address,
+          typeId: existingDeployment.typeId,
+          config: config.TESTNET
+        })
+      : await commons.deploy.generateDeployWithTypeIdTx({
+          cellProvider: indexer,
+          scriptBinary,
+          fromInfo: wallet.address,
+          config: config.TESTNET
+        });
 
   let txSkeleton = commons.secp256k1Blake160.prepareSigningEntries(deployResult.txSkeleton, {
     config: config.TESTNET
@@ -70,11 +102,16 @@ async function main() {
     deployerAddress: wallet.address,
     walletFile,
     txHash: txHash ?? '<dry-run-not-broadcast>',
+    mode: deployMode,
+    previousTxHash: existingDeployment?.txHash,
     scriptConfig: deployResult.scriptConfig,
-    typeId: deployResult.typeId,
+    typeId: deployMode === 'data2' ? undefined : deployResult.typeId ?? existingDeployment?.typeId,
     env: {
       FIBERPASS_VAULT_CODE_HASH: deployResult.scriptConfig.CODE_HASH,
       FIBERPASS_VAULT_HASH_TYPE: deployResult.scriptConfig.HASH_TYPE,
+      FIBERPASS_VAULT_CELL_DEP_TX_HASH: deployResult.scriptConfig.TX_HASH,
+      FIBERPASS_VAULT_CELL_DEP_INDEX: deployResult.scriptConfig.INDEX,
+      FIBERPASS_VAULT_CELL_DEP_TYPE: deployResult.scriptConfig.DEP_TYPE,
       FIBERPASS_OPERATOR_LOCK_HASH: process.env.FIBERPASS_OPERATOR_LOCK_HASH || '<set operator lock hash>'
     }
   };
@@ -84,10 +121,12 @@ async function main() {
   writeFileSync(outputFile, JSON.stringify(deployment, null, 2), { mode: 0o600 });
 
   console.log('deployer=' + wallet.address);
+  console.log('mode=' + deployment.mode);
   console.log('broadcast=' + String(broadcast));
   console.log('tx_hash=' + deployment.txHash);
   console.log('code_hash=' + deployResult.scriptConfig.CODE_HASH);
   console.log('hash_type=' + deployResult.scriptConfig.HASH_TYPE);
+  console.log('cell_dep=' + deployResult.scriptConfig.TX_HASH + ':' + deployResult.scriptConfig.INDEX);
   console.log('deployment_file=' + outputFile);
 }
 

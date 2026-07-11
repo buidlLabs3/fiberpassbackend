@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { normalizePaymentWorkerId, runPaymentWorkerOnce } from '../services/automation.service.js';
+import { runDueSessionPayouts } from '../services/session.service.js';
 
 const workerId = normalizePaymentWorkerId(process.env.PAYMENT_WORKER_ID);
 let stopping = false;
@@ -16,6 +17,11 @@ async function runLoop(): Promise<void> {
 
   while (!stopping) {
     try {
+      const scheduledPayouts = await runDueSessionPayouts({ limit: env.PAYMENT_WORKER_BATCH_SIZE });
+      if (scheduledPayouts.processed > 0 || scheduledPayouts.failed > 0) {
+        logger.info('scheduled_payouts_processed', { workerId, ...scheduledPayouts });
+      }
+
       const result = await runPaymentWorkerOnce({ workerId, limit: env.PAYMENT_WORKER_BATCH_SIZE });
       if (result.processed > 0) {
         logger.info('payment_worker_batch_processed', { workerId, ...result });

@@ -32,7 +32,7 @@ npm run worker:webhooks
 
 ## Fiber Provider
 
-`FIBER_PROVIDER=rpc` is the only supported provider. Configure `FIBER_RPC_URL`, `FIBER_PEER_ID`, and optional `FIBER_API_KEY` for your Fiber node. Configure `FIBERPASS_VAULT_CODE_HASH`, `FIBERPASS_VAULT_HASH_TYPE`, and `FIBERPASS_OPERATOR_LOCK_HASH` after deploying the vault lock script so funding requests derive per-user vault addresses. `FIBERPASS_TREASURY_ADDRESS` remains a temporary fallback while vault deployment is not configured.
+`FIBER_PROVIDER=rpc` is the only supported provider. Configure `FIBER_RPC_URL`, `FIBER_PEER_ID`, and optional `FIBER_API_KEY` for your Fiber node. Configure `FIBERPASS_VAULT_CODE_HASH`, `FIBERPASS_VAULT_HASH_TYPE`, `FIBERPASS_VAULT_CELL_DEP_TX_HASH`, `FIBERPASS_VAULT_CELL_DEP_INDEX`, and `FIBERPASS_OPERATOR_LOCK_HASH` after deploying the vault lock script so funding requests derive per-user vault addresses and direct vault payouts can spend those cells. Keep `FIBERPASS_OPERATOR_PRIVATE_KEY` only in local/prod secrets; it authorizes vault payout transactions. `FIBERPASS_TREASURY_ADDRESS` remains a temporary fallback while vault deployment is not configured.
 
 See `docs/fiber-network-spike.md` for integration notes.
 

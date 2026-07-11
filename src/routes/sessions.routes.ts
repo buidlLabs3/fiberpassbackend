@@ -21,7 +21,9 @@ import type { AuthenticatedRequest } from '../types/auth.js';
 
 const recipientWalletSchema = z.object({
   name: z.string().trim().min(1).max(120),
-  address: z.string().trim().min(1).max(190).refine(isFiberCkbAddress, FIBER_CKB_ADDRESS_ERROR)
+  address: z.string().trim().min(1).max(190).refine(isFiberCkbAddress, FIBER_CKB_ADDRESS_ERROR),
+  amount: z.coerce.number().positive().max(CREATE_SESSION_POLICY.maxLimit).optional(),
+  fiberInvoice: z.string().trim().min(16, 'Enter a full Fiber invoice/payment request; short placeholders cannot be paid.').max(2000).optional()
 });
 
 const createSessionSchema = z.object({
