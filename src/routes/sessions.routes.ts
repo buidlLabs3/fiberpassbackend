@@ -6,12 +6,15 @@ import { liveEvents } from '../lib/liveEvents.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
 import {
   CREATE_SESSION_POLICY,
+  claimRecipientWallet,
   createSession,
   getCreateSessionPolicy,
+  getRecipientClaim,
   getSessionsOverview,
   isValidIconType,
   isValidPaymentPurpose,
   isValidReleaseCadence,
+  resendRecipientInvites,
   revokeSession,
   settleSession,
   togglePauseSession,
@@ -21,10 +24,11 @@ import type { AuthenticatedRequest } from '../types/auth.js';
 
 const recipientWalletSchema = z.object({
   name: z.string().trim().min(1).max(120),
-  address: z.string().trim().min(1).max(190).refine(isFiberCkbAddress, FIBER_CKB_ADDRESS_ERROR),
+  address: z.string().trim().max(190).optional().or(z.literal('')).refine((value) => !value || isFiberCkbAddress(value), FIBER_CKB_ADDRESS_ERROR),
+  email: z.string().trim().email().max(190).optional().or(z.literal('')),
   amount: z.coerce.number().positive().max(CREATE_SESSION_POLICY.maxLimit).optional(),
   fiberInvoice: z.string().trim().min(16, 'Enter a full Fiber invoice/payment request; short placeholders cannot be paid.').max(2000).optional()
-});
+}).refine((value) => Boolean(value.address || value.email), 'Each recipient needs a CKB wallet address or email.');
 
 const createSessionSchema = z.object({
   name: z.string().trim().min(1).max(80),
@@ -60,8 +64,21 @@ const topUpSchema = z.object({
 });
 
 const paramsSchema = z.object({ id: z.string().min(1) });
+const claimParamsSchema = z.object({ token: z.string().trim().min(32).max(200) });
+const claimWalletSchema = z.object({ address: z.string().trim().min(1).max(190).refine(isFiberCkbAddress, FIBER_CKB_ADDRESS_ERROR) });
 
 export const sessionsRouter = Router();
+
+sessionsRouter.get('/recipient-claims/:token', asyncHandler(async (request, response) => {
+  const { token } = claimParamsSchema.parse(request.params);
+  response.json(await getRecipientClaim(token));
+}));
+
+sessionsRouter.post('/recipient-claims/:token', asyncHandler(async (request, response) => {
+  const { token } = claimParamsSchema.parse(request.params);
+  const { address } = claimWalletSchema.parse(request.body ?? {});
+  response.json(await claimRecipientWallet(token, address));
+}));
 
 sessionsRouter.get('/sessions/create-policy', requireAuth, asyncHandler(async (_request, response) => {
   response.json(getCreateSessionPolicy());
@@ -83,6 +100,12 @@ sessionsRouter.post('/sessions/:id/top-up', requireAuth, asyncHandler(async (req
   const { id } = paramsSchema.parse(request.params);
   const { amount } = topUpSchema.parse(request.body ?? {});
   response.json(await topUpSession(id, walletId, amount));
+}));
+
+sessionsRouter.post('/sessions/:id/recipient-invites/resend', requireAuth, asyncHandler(async (request, response) => {
+  const { walletId } = (request as AuthenticatedRequest).auth;
+  const { id } = paramsSchema.parse(request.params);
+  response.json(await resendRecipientInvites(id, walletId));
 }));
 
 sessionsRouter.post('/sessions/:id/toggle-pause', requireAuth, asyncHandler(async (request, response) => {

@@ -26,16 +26,28 @@ const transactionLogSchema = new Schema(
 const recipientWalletSchema = new Schema(
   {
     name: { type: String, required: true, trim: true },
-    address: { type: String, required: true, trim: true },
+    address: { type: String, trim: true, default: '' },
+    email: { type: String, trim: true, lowercase: true },
     amount: { type: Number, min: 0 },
     amountMinor: { type: Number, min: 1 },
     fiberInvoice: { type: String, trim: true },
-    status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' },
+    status: { type: String, enum: ['awaiting_details', 'pending', 'processing', 'paid', 'failed'], default: 'pending' },
+    inviteStatus: { type: String, enum: ['not_required', 'pending', 'sent', 'claimed', 'expired', 'send_failed'], default: 'not_required' },
+    inviteTokenHash: { type: String, trim: true, index: true },
+    inviteTokenExpiresAt: { type: Date },
+    inviteSentAt: { type: Date },
+    inviteClaimedAt: { type: Date },
+    inviteLastFailure: { type: String, trim: true },
     chargeAttemptId: { type: String, trim: true },
     paidAt: { type: Date },
     lastAttemptAt: { type: Date },
     lastFailureCode: { type: String, trim: true },
-    lastFailureMessage: { type: String, trim: true }
+    lastFailureMessage: { type: String, trim: true },
+    payoutProofId: { type: String, trim: true },
+    payoutExplorerUrl: { type: String, trim: true },
+    payoutNotifiedAt: { type: Date },
+    payoutNotificationStatus: { type: String, enum: ['not_required', 'pending', 'sent', 'failed'], default: 'not_required' },
+    payoutNotificationFailure: { type: String, trim: true }
   },
   { _id: false }
 );
