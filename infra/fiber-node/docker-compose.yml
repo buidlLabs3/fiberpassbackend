@@ -1,0 +1,49 @@
+services:
+  fiber-node:
+    image: ${FIBER_IMAGE:-nervos/fiber:latest}
+    container_name: fiberpass-fiber-node
+    restart: unless-stopped
+    environment:
+      FIBER_SECRET_KEY_PASSWORD: ${FIBER_SECRET_KEY_PASSWORD:?set FIBER_SECRET_KEY_PASSWORD}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./data:/fiber
+    ports:
+      - "8228:8228/tcp"
+    networks:
+      - fiberpass-fiber
+    healthcheck:
+      test: ["CMD-SHELL", "fnn-cli info >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  fiber-rpc-gateway:
+    image: caddy:2-alpine
+    container_name: fiberpass-fiber-rpc-gateway
+    restart: unless-stopped
+    depends_on:
+      fiber-node:
+        condition: service_started
+    environment:
+      FIBER_RPC_DOMAIN: ${FIBER_RPC_DOMAIN:?set FIBER_RPC_DOMAIN}
+      FIBER_RPC_PROXY_TOKEN: ${FIBER_RPC_PROXY_TOKEN:?set FIBER_RPC_PROXY_TOKEN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    networks:
+      - fiberpass-fiber
+
+networks:
+  fiberpass-fiber:
+    name: fiberpass-fiber
+
+volumes:
+  caddy-data:
+  caddy-config:
+
