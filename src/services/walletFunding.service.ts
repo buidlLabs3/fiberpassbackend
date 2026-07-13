@@ -3,22 +3,36 @@ import { env } from '../config/env.js';
 import { ApiError } from '../lib/errors.js';
 import { liveEvents } from '../lib/liveEvents.js';
 import { fromMinorUnits, toMinorUnits } from '../lib/money.js';
+import { ckbTransactionExplorerUrl } from '../lib/ckbExplorer.js';
+import { ChargeAttemptModel } from '../models/chargeAttempt.model.js';
+import { SessionModel } from '../models/session.model.js';
 import { WalletFundingModel, type WalletFundingRecord } from '../models/walletFunding.model.js';
-import { WalletModel } from '../models/wallet.model.js';
+import { WalletModel, type WalletRecord } from '../models/wallet.model.js';
 import { getSessionsOverview, type SessionsOverviewDto } from './session.service.js';
 import { writeAuditLog } from './audit.service.js';
 import {
   findVaultDepositInTransaction,
+  getCkbBalanceForAddress,
+  getCkbBalanceForLock,
+  listCkbLockActivity,
   listLiveVaultCells,
   normalizeCkbTxHash,
-  type CkbDepositOutput
+  transactionSpendsLock,
+  type CkbDepositOutput,
+  type CkbLiveCell,
+  type CkbLockActivity
 } from './ckbChain.service.js';
 import { deriveVaultForWallet, getVaultRuntimeConfig, minimalVaultCellCapacityShannons, type DerivedVaultDto } from './vault.service.js';
 
 const FUNDING_CURRENCY = 'CKB';
 const MIN_FUNDING_MINOR = toMinorUnits('138', FUNDING_CURRENCY);
 const MAX_FUNDING_MINOR = toMinorUnits('100000', FUNDING_CURRENCY);
+const MAX_WALLET_ACTIVITY = 80;
 type WalletFundingDocument = WalletFundingRecord & { save: () => Promise<unknown> };
+
+type ActivitySource = 'funding' | 'chain' | 'payment' | 'session';
+
+type ChainBalanceStatus = 'ok' | 'unavailable' | 'not_configured';
 
 export interface WalletFundingConfigDto {
   currency: string;
@@ -70,9 +84,48 @@ export interface WalletFundingRequestDto {
   confirmedAt?: string;
 }
 
+export interface WalletChainBalanceDto {
+  amount: number;
+  amountMinor: number;
+  currency: string;
+  liveCellCount: number;
+  status: ChainBalanceStatus;
+  error?: string;
+}
+
+export interface WalletChainActivityDto {
+  id: string;
+  source: ActivitySource;
+  type: string;
+  label: string;
+  status?: string;
+  amount?: number;
+  amountMinor?: number;
+  currency: string;
+  txHash?: string;
+  explorerUrl?: string;
+  timestamp?: string;
+  blockNumber?: string;
+  direction?: 'input' | 'output' | 'unknown';
+  referenceId?: string;
+  details?: string;
+}
+
+export interface WalletChainStateDto {
+  network: string;
+  currency: string;
+  wallet: WalletChainBalanceDto & { address: string };
+  vault?: (WalletChainBalanceDto & { address: string; scriptHash?: string });
+  activities: WalletChainActivityDto[];
+  lastSyncedAt: string;
+}
+
 export interface WalletFundingOverviewDto {
   config: WalletFundingConfigDto;
   requests: WalletFundingRequestDto[];
+  chain: WalletChainStateDto;
+  activities: WalletChainActivityDto[];
+  recoveredDeposits?: number;
 }
 
 function newFundingId(): string {
@@ -81,6 +134,10 @@ function newFundingId(): string {
 
 function fundingMemo(walletId: string, fundingId: string): string {
   return ['fiberpass', fundingId, walletId.slice(0, 12)].join(':');
+}
+
+function recoveredFundingMemo(cell: CkbLiveCell): string {
+  return 'fiberpass:recovered:' + cell.txHash.slice(2, 14) + ':' + cell.outputIndex;
 }
 
 function minimumFundingMinor(vault?: DerivedVaultDto | null): number {
@@ -247,12 +304,262 @@ async function applyConfirmedFunding(input: {
   });
 }
 
-export async function listWalletFunding(walletId: string): Promise<WalletFundingOverviewDto> {
-  const requests = await WalletFundingModel.find({ walletId }).sort({ createdAt: -1 }).limit(20).lean<(WalletFundingRecord & { createdAt?: Date; confirmedAt?: Date; chainConfirmedAt?: Date })[]>();
+function emptyBalance(status: ChainBalanceStatus, error?: string): WalletChainBalanceDto {
+  return {
+    amount: 0,
+    amountMinor: 0,
+    currency: FUNDING_CURRENCY,
+    liveCellCount: 0,
+    status,
+    error
+  };
+}
+
+function chainActivityToDto(input: { item: CkbLockActivity; label: string; source: ActivitySource }): WalletChainActivityDto {
+  return {
+    id: input.source + ':tx:' + input.item.txHash,
+    source: input.source,
+    type: 'chain_transaction',
+    label: input.label,
+    status: 'committed',
+    currency: FUNDING_CURRENCY,
+    txHash: input.item.txHash,
+    explorerUrl: ckbTransactionExplorerUrl(input.item.txHash, env.FIBER_NETWORK),
+    blockNumber: input.item.blockNumber
+  };
+}
+
+async function getWalletChainState(walletId: string, address: string): Promise<WalletChainStateDto> {
+  const vault = deriveVaultForWallet({ walletId });
+  let walletBalance: WalletChainStateDto['wallet'] = { address, ...emptyBalance(env.CKB_TESTNET_INDEXER_URL ? 'ok' : 'not_configured') };
+  let vaultBalance: WalletChainStateDto['vault'];
+  const activities: WalletChainActivityDto[] = [];
+
+  if (!env.CKB_TESTNET_INDEXER_URL) {
+    return {
+      network: env.FIBER_NETWORK,
+      currency: FUNDING_CURRENCY,
+      wallet: { address, ...emptyBalance('not_configured', 'CKB indexer URL is not configured.') },
+      vault: vault ? { address: vault.address, scriptHash: vault.scriptHash, ...emptyBalance('not_configured', 'CKB indexer URL is not configured.') } : undefined,
+      activities,
+      lastSyncedAt: new Date().toISOString()
+    };
+  }
+
+  try {
+    const balance = await getCkbBalanceForAddress(address);
+    walletBalance = {
+      address,
+      amount: fromMinorUnits(balance.balanceShannons, FUNDING_CURRENCY),
+      amountMinor: balance.balanceShannons,
+      currency: FUNDING_CURRENCY,
+      liveCellCount: balance.liveCellCount,
+      status: 'ok'
+    };
+  } catch (error) {
+    walletBalance = { address, ...emptyBalance('unavailable', error instanceof Error ? error.message : 'Could not load JoyID wallet chain balance.') };
+  }
+
+  if (vault) {
+    try {
+      const balance = await getCkbBalanceForLock(vault.script);
+      vaultBalance = {
+        address: vault.address,
+        scriptHash: vault.scriptHash,
+        amount: fromMinorUnits(balance.balanceShannons, FUNDING_CURRENCY),
+        amountMinor: balance.balanceShannons,
+        currency: FUNDING_CURRENCY,
+        liveCellCount: balance.liveCellCount,
+        status: 'ok'
+      };
+      const vaultActivity = await listCkbLockActivity({ lock: vault.script, limit: 12 }).catch(() => []);
+      activities.push(...vaultActivity.map((item) => chainActivityToDto({ item, label: 'FiberPass vault transaction', source: 'chain' })));
+    } catch (error) {
+      vaultBalance = { address: vault.address, scriptHash: vault.scriptHash, ...emptyBalance('unavailable', error instanceof Error ? error.message : 'Could not load FiberPass vault chain balance.') };
+    }
+  }
+
+  return {
+    network: env.FIBER_NETWORK,
+    currency: FUNDING_CURRENCY,
+    wallet: walletBalance,
+    vault: vaultBalance,
+    activities: dedupeActivities(activities),
+    lastSyncedAt: new Date().toISOString()
+  };
+}
+
+function dedupeActivities(activities: WalletChainActivityDto[]): WalletChainActivityDto[] {
+  const seen = new Set<string>();
+  const result: WalletChainActivityDto[] = [];
+  for (const activity of activities) {
+    const key = activity.source === 'chain' && activity.txHash ? activity.source + ':' + activity.txHash : activity.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(activity);
+  }
+  return result;
+}
+
+function activityTime(activity: WalletChainActivityDto): number {
+  if (activity.timestamp) {
+    const parsed = new Date(activity.timestamp).getTime();
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (activity.blockNumber) {
+    return Number(BigInt(activity.blockNumber));
+  }
+  return 0;
+}
+
+async function buildWalletActivities(walletId: string, chain: WalletChainStateDto): Promise<WalletChainActivityDto[]> {
+  const [funding, attempts, sessions] = await Promise.all([
+    WalletFundingModel.find({ walletId }).sort({ createdAt: -1 }).limit(50).lean<Array<WalletFundingRecord & { createdAt?: Date; confirmedAt?: Date; chainConfirmedAt?: Date }>>(),
+    ChargeAttemptModel.find({ ownerWalletId: walletId }).sort({ createdAt: -1 }).limit(50).lean<Array<{
+      attemptId: string;
+      sessionId: string;
+      amount: number;
+      amountMinor?: number | null;
+      currency: string;
+      type: string;
+      status: string;
+      proofId?: string | null;
+      createdAt?: Date;
+    }>>(),
+    SessionModel.find({ ownerWalletId: walletId }).sort({ updatedAt: -1 }).limit(25).select('publicId name currency logs createdAt updatedAt').lean<Array<{
+      publicId: string;
+      name: string;
+      currency: string;
+      logs?: Array<{ id: string; type: string; timestamp: string; amount: number; amountMinor?: number }>;
+      createdAt?: Date;
+      updatedAt?: Date;
+    }>>()
+  ]);
+
+  const knownTxHashes = new Set<string>();
+  for (const item of funding) {
+    const txHash = item.chainTxHash ?? item.proofId ?? undefined;
+    if (txHash) knownTxHashes.add(txHash);
+  }
+  for (const attempt of attempts) {
+    if (attempt.proofId) knownTxHashes.add(attempt.proofId);
+  }
+
+  const activities: WalletChainActivityDto[] = chain.activities.filter((activity) => !activity.txHash || !knownTxHashes.has(activity.txHash));
+  for (const item of funding) {
+    const amountMinor = item.amountMinor;
+    const txHash = item.chainTxHash ?? item.proofId ?? undefined;
+    activities.push({
+      id: 'funding:' + item.fundingId,
+      source: 'funding',
+      type: 'wallet_funding',
+      label: item.status === 'confirmed' ? 'Vault funding confirmed' : 'Vault funding requested',
+      status: item.status,
+      amount: fromMinorUnits(amountMinor, item.currency),
+      amountMinor,
+      currency: item.currency,
+      txHash,
+      explorerUrl: ckbTransactionExplorerUrl(txHash, item.network),
+      timestamp: (item.chainConfirmedAt ?? item.confirmedAt ?? item.createdAt ?? new Date()).toISOString(),
+      blockNumber: item.chainBlockNumber ?? undefined,
+      referenceId: item.fundingId,
+      details: item.memo
+    });
+  }
+
+  for (const attempt of attempts) {
+    const amountMinor = attempt.amountMinor ?? toMinorUnits(String(attempt.amount), attempt.currency);
+    activities.push({
+      id: 'payment:' + attempt.attemptId,
+      source: 'payment',
+      type: 'payment_attempt',
+      label: attempt.type,
+      status: attempt.status,
+      amount: fromMinorUnits(amountMinor, attempt.currency),
+      amountMinor,
+      currency: attempt.currency,
+      txHash: attempt.proofId ?? undefined,
+      explorerUrl: ckbTransactionExplorerUrl(attempt.proofId ?? undefined, env.FIBER_NETWORK),
+      timestamp: (attempt.createdAt ?? new Date()).toISOString(),
+      referenceId: attempt.sessionId
+    });
+  }
+
+  for (const session of sessions) {
+    for (const log of session.logs ?? []) {
+      activities.push({
+        id: 'session:' + session.publicId + ':' + log.id,
+        source: 'session',
+        type: 'session_log',
+        label: session.name + ': ' + log.type,
+        amount: log.amount,
+        amountMinor: log.amountMinor,
+        currency: session.currency,
+        timestamp: log.timestamp,
+        referenceId: session.publicId
+      });
+    }
+  }
+
+  return dedupeActivities(activities)
+    .sort((a, b) => activityTime(b) - activityTime(a))
+    .slice(0, MAX_WALLET_ACTIVITY);
+}
+
+async function buildFundingOverview(walletId: string, recoveredDeposits = 0): Promise<WalletFundingOverviewDto> {
+  const wallet = await getWalletOrThrow(walletId);
+  const requests = await WalletFundingModel.find({ walletId }).sort({ createdAt: -1 }).limit(50).lean<(WalletFundingRecord & { createdAt?: Date; confirmedAt?: Date; chainConfirmedAt?: Date })[]>();
+  const chain = await getWalletChainState(walletId, wallet.address);
+  const activities = await buildWalletActivities(walletId, chain);
   return {
     config: getFundingConfig(walletId),
-    requests: requests.map(toFundingDto)
+    requests: requests.map(toFundingDto),
+    chain,
+    activities,
+    recoveredDeposits
   };
+}
+
+async function createRecoveredFundingRecord(input: { wallet: WalletRecord; vault: DerivedVaultDto; cell: CkbLiveCell }): Promise<WalletFundingDocument> {
+  const fundingId = newFundingId();
+  const record = await WalletFundingModel.create({
+    fundingId,
+    walletId: input.wallet.walletId,
+    walletAddress: input.wallet.address,
+    amount: fromMinorUnits(input.cell.capacityShannons, FUNDING_CURRENCY),
+    amountMinor: input.cell.capacityShannons,
+    currency: FUNDING_CURRENCY,
+    network: env.FIBER_NETWORK,
+    depositMode: 'vault',
+    depositAddress: input.vault.address,
+    vaultScriptHash: input.vault.scriptHash,
+    vaultScriptArgs: input.vault.script.args,
+    vaultOwnerLockHash: input.vault.ownerLockHash,
+    vaultOwnerLockHashSource: input.vault.ownerLockHashSource,
+    vaultAccountIdHash: input.vault.accountIdHash,
+    memo: recoveredFundingMemo(input.cell),
+    status: 'pending'
+  });
+
+  await writeAuditLog({
+    actorWalletId: input.wallet.walletId,
+    actorAddress: input.wallet.address,
+    action: 'wallet_funding.recovered_requested',
+    targetType: 'wallet_funding',
+    targetId: fundingId,
+    metadata: {
+      amountMinor: input.cell.capacityShannons,
+      txHash: input.cell.txHash,
+      outPoint: input.cell.outPoint,
+      vaultScriptHash: input.vault.scriptHash
+    }
+  });
+
+  return record as WalletFundingDocument;
+}
+
+export async function listWalletFunding(walletId: string): Promise<WalletFundingOverviewDto> {
+  return buildFundingOverview(walletId);
 }
 
 export async function createWalletFundingRequest(walletId: string, amount: number): Promise<WalletFundingRequestDto> {
@@ -295,24 +602,24 @@ export async function createWalletFundingRequest(walletId: string, amount: numbe
 }
 
 export async function syncWalletFunding(walletId: string): Promise<WalletFundingOverviewDto> {
-  const pendingRequests = await WalletFundingModel.find({ walletId, status: 'pending', depositMode: 'vault' }).sort({ createdAt: 1 });
-  if (pendingRequests.length === 0) {
-    return listWalletFunding(walletId);
+  const wallet = await getWalletOrThrow(walletId);
+  const vault = deriveVaultForWallet({ walletId });
+  let recoveredDeposits = 0;
+
+  if (!vault) {
+    return buildFundingOverview(walletId);
   }
 
-  const used = await usedVaultOutPoints();
-  const vaultByScriptHash = new Map<string, Awaited<ReturnType<typeof listLiveVaultCells>>>();
+  const [pendingRequests, liveCells, used, confirmedVaultFundingCount] = await Promise.all([
+    WalletFundingModel.find({ walletId, status: 'pending', depositMode: 'vault' }).sort({ createdAt: 1 }),
+    listLiveVaultCells({ lock: vault.script, limit: 500 }),
+    usedVaultOutPoints(),
+    WalletFundingModel.countDocuments({ walletId, status: 'confirmed', depositMode: 'vault', vaultScriptHash: vault.scriptHash })
+  ]);
+  const recoverCurrentVaultState = confirmedVaultFundingCount === 0 && pendingRequests.length === 0;
 
   for (const funding of pendingRequests) {
-    const vault = deriveVaultForWallet({ walletId });
-    if (!vault || funding.vaultScriptHash !== vault.scriptHash) continue;
-
-    let liveCells = vaultByScriptHash.get(vault.scriptHash);
-    if (!liveCells) {
-      liveCells = await listLiveVaultCells({ lock: vault.script });
-      vaultByScriptHash.set(vault.scriptHash, liveCells);
-    }
-
+    if (funding.vaultScriptHash !== vault.scriptHash) continue;
     const cell = liveCells.find((candidate) => !used.has(candidate.outPoint) && candidate.capacityShannons >= funding.amountMinor);
     if (!cell) continue;
 
@@ -331,9 +638,31 @@ export async function syncWalletFunding(walletId: string): Promise<WalletFunding
     used.add(cell.outPoint);
   }
 
+  for (const cell of liveCells) {
+    if (used.has(cell.outPoint)) continue;
+    const isInternalVaultChange = await transactionSpendsLock({ txHash: cell.txHash, lock: vault.script }).catch(() => true);
+    if (isInternalVaultChange && !recoverCurrentVaultState) continue;
+
+    const recovered = await createRecoveredFundingRecord({ wallet: wallet.toObject(), vault, cell });
+    await applyConfirmedFunding({
+      walletId,
+      funding: recovered,
+      proofId: cell.txHash,
+      deposit: {
+        txHash: cell.txHash,
+        outputIndex: cell.outputIndex,
+        outPoint: cell.outPoint,
+        capacityShannons: cell.capacityShannons,
+        blockNumber: cell.blockNumber
+      }
+    });
+    used.add(cell.outPoint);
+    recoveredDeposits += 1;
+  }
+
   const overview = await getSessionsOverview(walletId);
   liveEvents.publish('overview:' + walletId, overview);
-  return listWalletFunding(walletId);
+  return buildFundingOverview(walletId, recoveredDeposits);
 }
 
 export async function confirmWalletFundingRequest(walletId: string, fundingId: string, proofId: string): Promise<SessionsOverviewDto> {

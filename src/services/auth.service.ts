@@ -297,11 +297,29 @@ export async function verifyAuthChallenge(input: AuthVerifyInput): Promise<AuthV
   challenge.consumedAt = new Date();
   await challenge.save();
 
-  const wallet = await recoverLegacyJoyIdWallet({
+  let wallet = await recoverLegacyJoyIdWallet({
     legacyEvmAddress: input.legacyEvmAddress,
     targetWallet: await ensureWalletForAddress(normalizedAddress),
     targetAddress: normalizedAddress
   });
+
+  try {
+    await syncWalletFunding(wallet.walletId);
+    const refreshedWallet = await WalletModel.findOne({ walletId: wallet.walletId });
+    if (refreshedWallet) wallet = refreshedWallet.toObject();
+  } catch (error) {
+    await writeAuditLog({
+      actorWalletId: wallet.walletId,
+      actorAddress: normalizedAddress,
+      action: 'wallet_funding.login_sync_failed',
+      targetType: 'wallet',
+      targetId: wallet.walletId,
+      metadata: {
+        error: error instanceof Error ? error.message : 'Unknown funding sync error'
+      }
+    });
+  }
+
   const token = randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
   await AuthSessionModel.create({

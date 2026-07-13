@@ -4,7 +4,8 @@ import { ApiError } from '../lib/errors.js';
 
 type RpcScript = { code_hash: string; hash_type: string; args: string };
 type RpcOutput = { capacity: string; lock: RpcScript; type?: RpcScript | null };
-type RpcTransaction = { hash: string; outputs: RpcOutput[]; outputs_data?: string[] };
+type RpcInput = { previous_output?: { tx_hash: string; index: string } | null };
+type RpcTransaction = { hash: string; inputs?: RpcInput[]; outputs: RpcOutput[]; outputs_data?: string[] };
 type RpcTxStatus = { status: string; block_hash?: string | null; block_number?: string | null };
 type RpcTransactionResult = { transaction: RpcTransaction; tx_status: RpcTxStatus; cycles?: string };
 type RpcCell = {
@@ -14,6 +15,15 @@ type RpcCell = {
   output_data: string;
   tx_index: string;
 };
+type RpcCellsResult = { objects: RpcCell[]; last_cursor?: string };
+type RpcTransactionSummary = {
+  tx_hash: string;
+  block_number: string;
+  tx_index: string;
+  io_index?: string;
+  io_type?: 'input' | 'output';
+};
+type RpcTransactionsResult = { objects: RpcTransactionSummary[]; last_cursor?: string };
 
 export interface CkbDepositOutput {
   txHash: string;
@@ -33,8 +43,25 @@ export interface CkbLiveCell {
   txIndex: string;
 }
 
+export interface CkbBalanceResult {
+  address?: string;
+  lock: Script;
+  balanceShannons: number;
+  liveCellCount: number;
+}
+
+export interface CkbLockActivity {
+  txHash: string;
+  blockNumber: string;
+  txIndex: string;
+  ioIndex?: string;
+  ioType?: 'input' | 'output';
+}
+
 const TX_HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const DEFAULT_MAX_LIVE_CELLS = 100;
+const MAX_BALANCE_CELLS = 500;
+const MAX_ACTIVITY_ITEMS = 50;
 
 function networkConfig() {
   return env.FIBER_NETWORK.toLowerCase().includes('main') ? config.MAINNET : config.TESTNET;
@@ -111,9 +138,37 @@ export function parseCkbAddress(address: string): Script {
   }
 }
 
+function scriptToRpc(script: Script): RpcScript {
+  return {
+    code_hash: script.codeHash,
+    hash_type: script.hashType,
+    args: script.args
+  };
+}
+
 export async function getCkbTransaction(txHash: string): Promise<RpcTransactionResult | null> {
   const normalizedTxHash = normalizeCkbTxHash(txHash);
   return rpcRequest<RpcTransactionResult | null>(ckbRpcUrl(), 'get_transaction', [normalizedTxHash]);
+}
+
+export async function transactionSpendsLock(input: { txHash: string; lock: Script }): Promise<boolean> {
+  const transaction = await getCkbTransaction(input.txHash);
+  if (!transaction?.transaction.inputs?.length) return false;
+  const expectedKey = scriptKey(input.lock);
+
+  for (const txInput of transaction.transaction.inputs) {
+    const previous = txInput.previous_output;
+    if (!previous?.tx_hash || !previous.index) continue;
+    const previousTx = await getCkbTransaction(previous.tx_hash);
+    if (!previousTx) continue;
+    const previousIndex = Number(BigInt(previous.index));
+    const previousOutput = previousTx.transaction.outputs[previousIndex];
+    if (previousOutput && scriptKey(previousOutput.lock) === expectedKey) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export async function findVaultDepositInTransaction(input: {
@@ -161,19 +216,27 @@ export async function listLiveVaultCells(input: {
   minCapacityShannons?: number;
   limit?: number;
 }): Promise<CkbLiveCell[]> {
-  const limit = Math.min(Math.max(input.limit ?? DEFAULT_MAX_LIVE_CELLS, 1), DEFAULT_MAX_LIVE_CELLS);
+  const limit = Math.min(Math.max(input.limit ?? DEFAULT_MAX_LIVE_CELLS, 1), MAX_BALANCE_CELLS);
   const searchKey = {
-    script: {
-      code_hash: input.lock.codeHash,
-      hash_type: input.lock.hashType,
-      args: input.lock.args
-    },
+    script: scriptToRpc(input.lock),
     script_type: 'lock',
     script_search_mode: 'exact'
   };
-  const result = await rpcRequest<{ objects: RpcCell[] }>(ckbIndexerUrl(), 'get_cells', [searchKey, 'asc', '0x' + limit.toString(16)]);
+  const cells: RpcCell[] = [];
+  let cursor: string | undefined;
 
-  return result.objects
+  while (cells.length < limit) {
+    const pageLimit = Math.min(DEFAULT_MAX_LIVE_CELLS, limit - cells.length);
+    const params = cursor
+      ? [searchKey, 'asc', '0x' + pageLimit.toString(16), cursor]
+      : [searchKey, 'asc', '0x' + pageLimit.toString(16)];
+    const result = await rpcRequest<RpcCellsResult>(ckbIndexerUrl(), 'get_cells', params);
+    cells.push(...result.objects);
+    if (!result.last_cursor || result.objects.length === 0) break;
+    cursor = result.last_cursor;
+  }
+
+  return cells
     .map((cell) => ({
       txHash: cell.out_point.tx_hash.toLowerCase(),
       outputIndex: cell.out_point.index,
@@ -183,4 +246,40 @@ export async function listLiveVaultCells(input: {
       txIndex: cell.tx_index
     }))
     .filter((cell) => cell.capacityShannons >= (input.minCapacityShannons ?? 0));
+}
+
+
+export async function getCkbBalanceForLock(lock: Script): Promise<CkbBalanceResult> {
+  const liveCells = await listLiveVaultCells({ lock, limit: MAX_BALANCE_CELLS });
+  return {
+    lock,
+    balanceShannons: liveCells.reduce((total, cell) => total + cell.capacityShannons, 0),
+    liveCellCount: liveCells.length
+  };
+}
+
+export async function getCkbBalanceForAddress(address: string): Promise<CkbBalanceResult> {
+  const lock = parseCkbAddress(address);
+  return { ...(await getCkbBalanceForLock(lock)), address };
+}
+
+export async function listCkbLockActivity(input: { lock: Script; limit?: number }): Promise<CkbLockActivity[]> {
+  const limit = Math.min(Math.max(input.limit ?? MAX_ACTIVITY_ITEMS, 1), MAX_ACTIVITY_ITEMS);
+  const searchKey = {
+    script: scriptToRpc(input.lock),
+    script_type: 'lock',
+    script_search_mode: 'exact'
+  };
+  const result = await rpcRequest<RpcTransactionsResult>(ckbIndexerUrl(), 'get_transactions', [searchKey, 'desc', '0x' + limit.toString(16)]);
+  return result.objects.map((item) => ({
+    txHash: item.tx_hash.toLowerCase(),
+    blockNumber: item.block_number,
+    txIndex: item.tx_index,
+    ioIndex: item.io_index,
+    ioType: item.io_type
+  }));
+}
+
+export async function listCkbAddressActivity(address: string, limit?: number): Promise<CkbLockActivity[]> {
+  return listCkbLockActivity({ lock: parseCkbAddress(address), limit });
 }

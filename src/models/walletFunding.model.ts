@@ -25,7 +25,7 @@ const walletFundingSchema = new Schema(
     proofId: { type: String, trim: true },
     chainTxHash: { type: String, trim: true, index: true },
     chainOutputIndex: { type: String, trim: true },
-    chainOutPoint: { type: String, trim: true, index: true },
+    chainOutPoint: { type: String, trim: true },
     chainBlockHash: { type: String, trim: true },
     chainBlockNumber: { type: String, trim: true },
     chainCapacityShannons: { type: Number, min: 0 },

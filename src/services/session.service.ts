@@ -973,41 +973,48 @@ async function reconcileWalletBalanceWithCurrentVault(walletId: string): Promise
     return;
   }
 
-  const [wallet, openSessions] = await Promise.all([
+  const [wallet, sessions, fundingRecords] = await Promise.all([
     WalletModel.findOne({ walletId }).select('balance balanceMinor currency').lean<{ balance?: number | null; balanceMinor?: number | null; currency?: string | null }>(),
-    SessionModel.find({
-      ownerWalletId: walletId,
-      status: { $in: OPEN_STATUSES }
-    }).select('limit limitMinor spent spentMinor currency').lean<Array<{ limit?: number | null; limitMinor?: number | null; spent?: number | null; spentMinor?: number | null; currency?: string | null }>>()
-  ]);
-
-  if (!wallet) return;
-
-  const currentBalanceMinor = walletBalanceMinor(wallet);
-  const reservedMinor = openSessions.reduce((total, session) => {
-    const currency = session.currency ?? CREATE_SESSION_POLICY.currency;
-    const limitMinor = fallbackMinorUnits(session.limitMinor, session.limit, currency);
-    const spentMinor = fallbackMinorUnits(session.spentMinor, session.spent, currency);
-    return total + clampMinorUnits(limitMinor - spentMinor);
-  }, 0);
-
-  let availableMinor = currentBalanceMinor;
-  try {
-    const liveCells = await listLiveVaultCells({ lock: vault.script });
-    const liveCapacityMinor = liveCells.reduce((total, cell) => total + cell.capacityShannons, 0);
-    const liveAvailableMinor = clampMinorUnits(liveCapacityMinor - reservedMinor);
-    availableMinor = Math.min(currentBalanceMinor, liveAvailableMinor);
-  } catch {
-    const fundingRecords = await WalletFundingModel.find({
+    SessionModel.find({ ownerWalletId: walletId }).select('status limit limitMinor spent spentMinor currency').lean<Array<{ status?: string | null; limit?: number | null; limitMinor?: number | null; spent?: number | null; spentMinor?: number | null; currency?: string | null }>>(),
+    WalletFundingModel.find({
       walletId,
       status: 'confirmed',
       depositMode: 'vault',
       vaultScriptHash: vault.scriptHash
-    }).select('amount amountMinor currency').lean<Array<{ amount?: number | null; amountMinor?: number | null; currency?: string | null }>>();
-    const fundedMinor = fundingRecords.reduce((total, funding) => total + fallbackMinorUnits(funding.amountMinor, funding.amount, funding.currency ?? CREATE_SESSION_POLICY.currency), 0);
+    }).select('amount amountMinor currency').lean<Array<{ amount?: number | null; amountMinor?: number | null; currency?: string | null }>>()
+  ]);
+
+  if (!wallet) return;
+
+  const fundedMinor = fundingRecords.reduce((total, funding) => {
+    return total + fallbackMinorUnits(funding.amountMinor, funding.amount, funding.currency ?? CREATE_SESSION_POLICY.currency);
+  }, 0);
+  const spentMinor = sessions.reduce((total, session) => {
+    return total + fallbackMinorUnits(session.spentMinor, session.spent, session.currency ?? CREATE_SESSION_POLICY.currency);
+  }, 0);
+  const reservedMinor = sessions.reduce((total, session) => {
+    if (!OPEN_STATUSES.includes(session.status as SessionStatus)) return total;
+    const currency = session.currency ?? CREATE_SESSION_POLICY.currency;
+    const limitMinor = fallbackMinorUnits(session.limitMinor, session.limit, currency);
+    const sessionSpentMinor = fallbackMinorUnits(session.spentMinor, session.spent, currency);
+    return total + clampMinorUnits(limitMinor - sessionSpentMinor);
+  }, 0);
+
+  let availableMinor = fundedMinor > 0
+    ? clampMinorUnits(fundedMinor - spentMinor - reservedMinor)
+    : walletBalanceMinor(wallet);
+
+  try {
+    const liveCells = await listLiveVaultCells({ lock: vault.script, limit: 500 });
+    const liveCapacityMinor = liveCells.reduce((total, cell) => total + cell.capacityShannons, 0);
+    const liveAvailableMinor = clampMinorUnits(liveCapacityMinor - reservedMinor);
     if (fundedMinor > 0) {
-      availableMinor = Math.min(currentBalanceMinor, clampMinorUnits(fundedMinor - reservedMinor));
+      availableMinor = Math.min(availableMinor, liveAvailableMinor);
+    } else if (liveCapacityMinor > 0) {
+      availableMinor = liveAvailableMinor;
     }
+  } catch {
+    // Keep the ledger-derived balance when the indexer is unavailable.
   }
 
   await WalletModel.updateOne(
