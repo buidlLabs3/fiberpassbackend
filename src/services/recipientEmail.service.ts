@@ -14,6 +14,7 @@ interface RecipientInviteInput {
   expectedPaymentAt?: Date;
   reference?: string;
   conditionSummary?: string;
+  timeZone?: string;
 }
 
 interface PayoutReceiptInput {
@@ -27,15 +28,35 @@ interface PayoutReceiptInput {
   explorerUrl?: string;
   paidAt: Date;
   reference?: string;
+  timeZone?: string;
 }
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>\"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' }[char] ?? char));
 }
 
-function formatDate(date?: Date): string {
+function normalizeTimeZone(value?: string): string {
+  const candidate = value?.trim() || env.EMAIL_DEFAULT_TIME_ZONE || 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return 'UTC';
+  }
+}
+
+function formatDate(date?: Date, timeZone?: string): string {
   if (!date) return 'Not set';
-  return date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' }) + ' UTC';
+  const resolvedTimeZone = normalizeTimeZone(timeZone);
+  return new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: resolvedTimeZone,
+    timeZoneName: 'short'
+  }).format(date);
 }
 
 function formatAmount(minor: number, currency: string): string {
@@ -65,7 +86,9 @@ function emailShell(title: string, preheader: string, body: string): string {
 
 export async function sendRecipientInviteEmail(input: RecipientInviteInput): Promise<void> {
   const amount = formatAmount(input.amountMinor, input.currency);
-  const rows = detailRow('Payer / contractor', input.payerName) + detailRow('Pass', input.passName) + detailRow('Amount', amount) + detailRow('Expected payment', formatDate(input.expectedPaymentAt)) + detailRow('Magic link expires', formatDate(input.expiresAt)) + (input.reference ? detailRow('Reference', input.reference) : '') + (input.conditionSummary ? detailRow('Condition', input.conditionSummary) : '');
+  const expectedPaymentAt = formatDate(input.expectedPaymentAt, input.timeZone);
+  const expiresAt = formatDate(input.expiresAt, input.timeZone);
+  const rows = detailRow('Payer / contractor', input.payerName) + detailRow('Pass', input.passName) + detailRow('Amount', amount) + detailRow('Expected payment', expectedPaymentAt) + detailRow('Magic link expires', expiresAt) + (input.reference ? detailRow('Reference', input.reference) : '') + (input.conditionSummary ? detailRow('Condition', input.conditionSummary) : '');
   const body = '<p style="margin:0 0 18px;color:#d7ddeb;font-size:15px;line-height:1.7;">Hi ' + escapeHtml(input.recipientName) + ', ' + escapeHtml(input.payerName) + ' added you to a FiberPass payment. Add your CKB wallet address before the link expires so the payout can be released automatically.</p>' +
     '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:1px solid #2a3140;border-bottom:1px solid #2a3140;margin:18px 0;">' + rows + '</table>' +
     '<a href="' + escapeHtml(input.claimUrl) + '" style="display:inline-block;background:#b0c6ff;color:#10131a;text-decoration:none;font-weight:800;border-radius:12px;padding:13px 18px;font-size:13px;">Add CKB wallet</a>' +
@@ -73,7 +96,7 @@ export async function sendRecipientInviteEmail(input: RecipientInviteInput): Pro
   await sendEmail({
     to: input.to,
     subject: 'FiberPass payment details needed: ' + amount,
-    text: 'Hi ' + input.recipientName + ', ' + input.payerName + ' added you to ' + input.passName + '. Amount: ' + amount + '. Expected payment: ' + formatDate(input.expectedPaymentAt) + '. Link expires: ' + formatDate(input.expiresAt) + '. Add your CKB wallet: ' + input.claimUrl,
+    text: 'Hi ' + input.recipientName + ', ' + input.payerName + ' added you to ' + input.passName + '. Amount: ' + amount + '. Expected payment: ' + expectedPaymentAt + '. Link expires: ' + expiresAt + '. Add your CKB wallet: ' + input.claimUrl,
     html: emailShell('Payment details needed', 'Add your CKB wallet to receive a FiberPass payout.', body)
   });
 }
@@ -81,7 +104,8 @@ export async function sendRecipientInviteEmail(input: RecipientInviteInput): Pro
 export async function sendRecipientPayoutReceiptEmail(input: PayoutReceiptInput): Promise<void> {
   const amount = formatAmount(input.amountMinor, input.currency);
   const explorer = input.explorerUrl ?? '';
-  const rows = detailRow('Payer / contractor', input.payerName) + detailRow('Pass', input.passName) + detailRow('Amount', amount) + detailRow('Paid at', formatDate(input.paidAt)) + (input.reference ? detailRow('Reference', input.reference) : '');
+  const paidAt = formatDate(input.paidAt, input.timeZone);
+  const rows = detailRow('Payer / contractor', input.payerName) + detailRow('Pass', input.passName) + detailRow('Amount', amount) + detailRow('Paid at', paidAt) + (input.reference ? detailRow('Reference', input.reference) : '');
   const explorerButton = explorer ? '<a href="' + escapeHtml(explorer) + '" style="display:inline-block;background:#b0c6ff;color:#10131a;text-decoration:none;font-weight:800;border-radius:12px;padding:13px 18px;font-size:13px;margin-top:18px;">View on explorer</a>' : '';
   const body = '<p style="margin:0 0 18px;color:#d7ddeb;font-size:15px;line-height:1.7;">Hi ' + escapeHtml(input.recipientName) + ', your FiberPass payout from ' + escapeHtml(input.payerName) + ' was sent successfully.</p>' +
     '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:1px solid #2a3140;border-bottom:1px solid #2a3140;margin:18px 0;">' + rows + '</table>' +
@@ -89,7 +113,7 @@ export async function sendRecipientPayoutReceiptEmail(input: PayoutReceiptInput)
   await sendEmail({
     to: input.to,
     subject: 'FiberPass payout sent: ' + amount,
-    text: 'Hi ' + input.recipientName + ', your FiberPass payout from ' + input.payerName + ' was sent. Amount: ' + amount + '. Transaction: ' + input.txHash + (explorer ? '. Explorer: ' + explorer : ''),
+    text: 'Hi ' + input.recipientName + ', your FiberPass payout from ' + input.payerName + ' was sent. Amount: ' + amount + '. Paid at: ' + paidAt + '. Transaction: ' + input.txHash + (explorer ? '. Explorer: ' + explorer : ''),
     html: emailShell('Payout sent', 'Your FiberPass payout was sent successfully.', body)
   });
 }

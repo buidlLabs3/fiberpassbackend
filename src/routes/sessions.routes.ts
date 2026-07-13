@@ -65,7 +65,10 @@ const topUpSchema = z.object({
 
 const paramsSchema = z.object({ id: z.string().min(1) });
 const claimParamsSchema = z.object({ token: z.string().trim().min(32).max(200) });
-const claimWalletSchema = z.object({ address: z.string().trim().min(1).max(190).refine(isFiberCkbAddress, FIBER_CKB_ADDRESS_ERROR) });
+const claimWalletSchema = z.object({
+  address: z.string().trim().min(1).max(190).refine(isFiberCkbAddress, FIBER_CKB_ADDRESS_ERROR),
+  timeZone: z.string().trim().min(1).max(80).optional()
+});
 
 export const sessionsRouter = Router();
 
@@ -76,8 +79,8 @@ sessionsRouter.get('/recipient-claims/:token', asyncHandler(async (request, resp
 
 sessionsRouter.post('/recipient-claims/:token', asyncHandler(async (request, response) => {
   const { token } = claimParamsSchema.parse(request.params);
-  const { address } = claimWalletSchema.parse(request.body ?? {});
-  response.json(await claimRecipientWallet(token, address));
+  const { address, timeZone } = claimWalletSchema.parse(request.body ?? {});
+  response.json(await claimRecipientWallet(token, address, timeZone));
 }));
 
 sessionsRouter.get('/sessions/create-policy', requireAuth, asyncHandler(async (_request, response) => {

@@ -28,6 +28,7 @@ const recipientWalletSchema = new Schema(
     name: { type: String, required: true, trim: true },
     address: { type: String, trim: true, default: '' },
     email: { type: String, trim: true, lowercase: true },
+    recipientTimeZone: { type: String, trim: true },
     amount: { type: Number, min: 0 },
     amountMinor: { type: Number, min: 1 },
     fiberInvoice: { type: String, trim: true },

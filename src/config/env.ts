@@ -40,6 +40,7 @@ const envSchema = z.object({
   SMTP_PASS: z.string().optional().default(''),
   EMAIL_FROM_ADDRESS: z.string().email().default('xbeach329@gmail.com'),
   EMAIL_FROM_NAME: z.string().default('FiberPass'),
+  EMAIL_DEFAULT_TIME_ZONE: z.string().optional().default('Africa/Nairobi'),
   RECIPIENT_MAGIC_LINK_TTL_HOURS: z.coerce.number().int().positive().default(72),
   REQUEST_BODY_LIMIT: z.string().default('128kb'),
   TRUST_PROXY: booleanFromEnv.default(false),

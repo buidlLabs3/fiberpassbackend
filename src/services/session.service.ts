@@ -75,6 +75,7 @@ export interface RecipientWalletDto {
   name: string;
   address?: string;
   email?: string;
+  recipientTimeZone?: string;
   amount?: number;
   amountMinor?: number;
   fiberInvoice?: string;
@@ -603,7 +604,8 @@ async function sendSessionRecipientInvites(session: SessionRecord & { createdAt?
         expiresAt: invite.expiresAt,
         expectedPaymentAt: session.nextReleaseAt instanceof Date ? session.nextReleaseAt : undefined,
         reference: session.paymentReference ?? undefined,
-        conditionSummary: session.conditionSummary ?? undefined
+        conditionSummary: session.conditionSummary ?? undefined,
+        timeZone: wallet.recipientTimeZone
       });
       await SessionModel.updateOne(
         { publicId: session.publicId },
@@ -643,6 +645,18 @@ export interface RecipientClaimDto {
   expiresAt?: string;
   reference?: string;
   conditionSummary?: string;
+  recipientTimeZone?: string;
+}
+
+function normalizeTimeZone(value?: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.length > 80) return undefined;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: trimmed }).format(new Date());
+    return trimmed;
+  } catch {
+    return undefined;
+  }
 }
 
 function recipientClaimDto(input: { session: SessionRecord; wallet: RecipientWalletDto; expired: boolean }): RecipientClaimDto {
@@ -662,7 +676,8 @@ function recipientClaimDto(input: { session: SessionRecord; wallet: RecipientWal
     expectedPaymentAt: session.nextReleaseAt instanceof Date ? session.nextReleaseAt.toISOString() : undefined,
     expiresAt: wallet.inviteTokenExpiresAt instanceof Date ? wallet.inviteTokenExpiresAt.toISOString() : undefined,
     reference: session.paymentReference ?? undefined,
-    conditionSummary: session.conditionSummary ?? undefined
+    conditionSummary: session.conditionSummary ?? undefined,
+    recipientTimeZone: wallet.recipientTimeZone
   };
 }
 
@@ -689,7 +704,7 @@ export async function getRecipientClaim(token: string): Promise<RecipientClaimDt
   return recipientClaimDto(claim);
 }
 
-export async function claimRecipientWallet(token: string, address: string): Promise<RecipientClaimDto> {
+export async function claimRecipientWallet(token: string, address: string, timeZone?: string): Promise<RecipientClaimDto> {
   if (!isFiberCkbAddress(address)) {
     throw new ApiError(400, 'INVALID_RECIPIENT_ADDRESS', FIBER_CKB_ADDRESS_ERROR);
   }
@@ -700,6 +715,8 @@ export async function claimRecipientWallet(token: string, address: string): Prom
   claim.session.set('recipientWallets.' + claim.index + '.address', address.trim());
   claim.session.set('recipientWallets.' + claim.index + '.status', 'pending');
   claim.session.set('recipientWallets.' + claim.index + '.inviteStatus', 'claimed');
+  const recipientTimeZone = normalizeTimeZone(timeZone);
+  if (recipientTimeZone) claim.session.set('recipientWallets.' + claim.index + '.recipientTimeZone', recipientTimeZone);
   claim.session.set('recipientWallets.' + claim.index + '.inviteClaimedAt', new Date());
   await claim.session.save();
   await publishOverview(claim.session.ownerWalletId as string).catch(() => undefined);
@@ -1866,7 +1883,8 @@ async function sendPayoutReceiptIfNeeded(input: {
       txHash: input.attempt.proofId,
       explorerUrl: ckbTransactionExplorerUrl(input.attempt.proofId, input.attempt.network ?? env.FIBER_NETWORK),
       paidAt: new Date(),
-      reference: input.session.paymentReference ?? undefined
+      reference: input.session.paymentReference ?? undefined,
+      timeZone: input.wallet.recipientTimeZone
     });
     await markRecipientPayoutNotification({ sessionId: input.session.publicId, index: input.index, status: 'sent' });
   } catch (error) {
