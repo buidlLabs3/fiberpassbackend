@@ -1,0 +1,23 @@
+server {
+  listen ${PORT};
+  server_name _;
+
+  client_max_body_size 1m;
+
+  location = /health {
+    add_header Content-Type text/plain;
+    return 200 "ok\n";
+  }
+
+  location / {
+    if ($http_authorization != "Bearer ${FIBER_RPC_PROXY_TOKEN}") {
+      return 401;
+    }
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_pass http://127.0.0.1:8227;
+  }
+}

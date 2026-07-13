@@ -1,6 +1,6 @@
 services:
   fiber-node:
-    image: ${FIBER_IMAGE:-nervos/fiber:latest}
+    image: ${FIBER_IMAGE:-nervos/fiber:0.9.0-rc7}
     container_name: fiberpass-fiber-node
     restart: unless-stopped
     environment:
