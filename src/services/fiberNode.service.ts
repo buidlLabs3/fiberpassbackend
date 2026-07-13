@@ -391,9 +391,6 @@ export function buildFiberNodeAlerts(input: FiberNodeReadinessInput): FiberNodeA
     alerts.push(alert('NODE_LISTEN_ADDRESS_MISSING', 'warning', 'Fiber node did not report listen or announced addresses.', 'Confirm the node has a public TCP address and Railway proxy configuration.'));
   }
 
-  if (!input.peerIdConfigured) {
-    alerts.push(alert('CHANNEL_OPEN_NOT_CONFIGURED', 'warning', 'FIBER_PEER_ID is not configured for channel-open tests.', 'Set FIBER_PEER_ID when we are ready to open channels to a known testnet peer.'));
-  }
 
   if (input.peers.status === 'available') {
     const connectedCount = input.peers.connectedCount ?? 0;

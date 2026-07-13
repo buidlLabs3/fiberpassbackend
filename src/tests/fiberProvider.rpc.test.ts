@@ -16,5 +16,5 @@ await assert.rejects(
     amountMinor: 100_000_000,
     currency: 'CKB'
   }),
-  /FIBER_PEER_ID/
+  /external Fiber peer id/
 );

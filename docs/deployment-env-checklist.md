@@ -34,8 +34,8 @@ Fiber node infrastructure:
 - `FIBER_NETWORK=testnet`
 - `FIBER_RPC_URL`: reachable HTTPS Fiber RPC gateway, not `127.0.0.1` or `localhost`.
 - `FIBER_API_KEY`: gateway token if the node is protected.
-- `FIBER_PEER_ID`: own node peer id when opening channels.
-- `FIBER_TARGET_PEER_IDS`: comma-separated peer ids for channel strategy.
+- `FIBER_PEER_ID`: local node peer id reported by `node_info`.
+- `FIBER_TARGET_PEER_IDS`: comma-separated external peer ids used for channel opening and strategy.
 
 Email notifications:
 

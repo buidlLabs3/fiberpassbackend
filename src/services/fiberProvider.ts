@@ -100,9 +100,9 @@ export class RpcFiberProvider implements FiberProvider {
   }
 
   async createSession(input: FiberCreateSessionInput): Promise<FiberCreateSessionResult> {
-    const channelPeerId = typeof input.metadata?.fiberPeerId === 'string' ? input.metadata.fiberPeerId : env.FIBER_PEER_ID;
+    const channelPeerId = typeof input.metadata?.fiberPeerId === 'string' ? input.metadata.fiberPeerId.trim() : '';
     if (!channelPeerId) {
-      throw new Error('FIBER_PEER_ID is required to open a Fiber channel.');
+      throw new Error('An external Fiber peer id is required to open a Fiber channel.');
     }
 
     const raw = await this.rpc('open_channel', [{

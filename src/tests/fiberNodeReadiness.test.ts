@@ -66,7 +66,7 @@ const noPeerAlerts = buildFiberNodeAlerts({
   minOutboundCapacityMinor: 100_000_000
 });
 assert.ok(noPeerAlerts.some((alert) => alert.code === 'NODE_NO_PEERS'));
-assert.ok(noPeerAlerts.some((alert) => alert.code === 'CHANNEL_OPEN_NOT_CONFIGURED'));
+assert.equal(noPeerAlerts.some((alert) => alert.code === 'CHANNEL_OPEN_NOT_CONFIGURED'), false);
 assert.equal(paymentExecutionFromAlerts({ reachable: true, peers: { status: 'available', method: 'list_peers', connectedCount: 0, peers: [] }, channels, alerts: noPeerAlerts }).status, 'blocked');
 
 const unknownChannels = { status: 'unavailable' as const, method: 'list_channels|channels', error: 'method not found' };
