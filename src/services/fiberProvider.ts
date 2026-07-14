@@ -88,6 +88,10 @@ export interface FiberProvider {
   getStatus(sessionId: string, networkSessionId?: string): Promise<FiberStatusResult>;
 }
 
+function fiberRpcHexQuantity(value: number): string {
+  return '0x' + BigInt(Math.trunc(value)).toString(16);
+}
+
 export class RpcFiberProvider implements FiberProvider {
   readonly kind = 'rpc' as const;
   readonly network: string;
@@ -131,8 +135,8 @@ export class RpcFiberProvider implements FiberProvider {
     const raw = await this.rpc('send_payment', [{
       invoice,
       ...(input.metadata?.fiberAllowSelfPayment === true ? { allow_self_payment: true } : {}),
-      ...(typeof input.metadata?.fiberPaymentTimeoutSeconds === 'number' ? { timeout: input.metadata.fiberPaymentTimeoutSeconds } : {}),
-      ...(typeof input.metadata?.fiberMaxFeeAmountMinor === 'number' ? { max_fee_amount: String(input.metadata.fiberMaxFeeAmountMinor) } : {})
+      ...(typeof input.metadata?.fiberPaymentTimeoutSeconds === 'number' ? { timeout: fiberRpcHexQuantity(input.metadata.fiberPaymentTimeoutSeconds) } : {}),
+      ...(typeof input.metadata?.fiberMaxFeeAmountMinor === 'number' ? { max_fee_amount: fiberRpcHexQuantity(input.metadata.fiberMaxFeeAmountMinor) } : {})
     }]);
     return {
       provider: this.kind,
