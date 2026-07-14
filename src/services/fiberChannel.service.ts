@@ -77,8 +77,9 @@ function isLocalPeer(peerId: string, readiness: Awaited<ReturnType<typeof getFib
   return localPeerIds(readiness).has(peerId.trim());
 }
 
-function channelAmountMinor(amount?: number): number {
+function channelAmountMinor(amount?: number, options: { exact?: boolean } = {}): number {
   const requestedMinor = toMinorUnits(String(amount ?? env.FIBER_TEST_CHANNEL_AMOUNT_CKB), 'CKB');
+  if (options.exact && amount != null) return requestedMinor;
   const configuredMinimumMinor = toMinorUnits(String(env.FIBER_TEST_CHANNEL_AMOUNT_CKB), 'CKB');
   return Math.max(requestedMinor, configuredMinimumMinor);
 }
@@ -110,7 +111,7 @@ export async function getFiberChannelStrategy(): Promise<FiberChannelStrategyDto
   };
 }
 
-export async function openFiberTestChannel(input: { peerId?: string; amount?: number; actorWalletId?: string } = {}): Promise<FiberChannelOpenResultDto> {
+export async function openFiberTestChannel(input: { peerId?: string; amount?: number; actorWalletId?: string; exactAmount?: boolean } = {}): Promise<FiberChannelOpenResultDto> {
   const readiness = await getFiberNodeReadiness();
   const peerId = input.peerId?.trim() || targetPeerIds(readiness)[0]?.peerId;
   if (!peerId) {
@@ -120,7 +121,7 @@ export async function openFiberTestChannel(input: { peerId?: string; amount?: nu
     throw new ApiError(400, 'FIBER_TARGET_PEER_IS_LOCAL', 'Channel target peer cannot be the local Fiber node peer id. Use an external peer id.');
   }
 
-  const amountMinor = channelAmountMinor(input.amount);
+  const amountMinor = channelAmountMinor(input.amount, { exact: input.exactAmount === true });
   if (amountMinor <= 0) {
     throw new ApiError(400, 'INVALID_CHANNEL_AMOUNT', 'Fiber channel amount must be greater than zero.');
   }

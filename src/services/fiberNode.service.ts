@@ -31,6 +31,8 @@ export interface FiberNodeChannelSummaryDto {
   totalOutboundCapacity?: number;
   minOutboundCapacityMinor?: number;
   minOutboundCapacity?: number;
+  maxOutboundCapacityMinor?: number;
+  maxOutboundCapacity?: number;
   channels?: Array<{
     channelId?: string;
     peerId?: string;
@@ -339,7 +341,7 @@ export function summarizeFiberNodeChannels(probe: RpcProbeResult): FiberNodeChan
       const outboundCapacityMinorValue = outboundCapacityMinor(record);
       return {
         channelId: pickString(record, ['channel_id', 'channelId', 'id']),
-        peerId: pickString(record, ['peer_id', 'peerId', 'remote_peer_id', 'remotePeerId']),
+        peerId: pickString(record, ['peer_id', 'peerId', 'remote_peer_id', 'remotePeerId', 'pubkey']),
         status,
         outboundCapacityMinor: outboundCapacityMinorValue,
         outboundCapacity: outboundCapacityMinorValue == null ? undefined : fromMinorUnits(outboundCapacityMinorValue, 'CKB')
@@ -353,6 +355,7 @@ export function summarizeFiberNodeChannels(probe: RpcProbeResult): FiberNodeChan
     ? knownOutboundCapacities.reduce((sum, value) => sum + value, 0)
     : undefined;
   const minOutboundCapacityMinor = knownOutboundCapacities.length > 0 ? Math.min(...knownOutboundCapacities) : undefined;
+  const maxOutboundCapacityMinor = knownOutboundCapacities.length > 0 ? Math.max(...knownOutboundCapacities) : undefined;
 
   return {
     status: 'available',
@@ -363,6 +366,8 @@ export function summarizeFiberNodeChannels(probe: RpcProbeResult): FiberNodeChan
     totalOutboundCapacity: totalOutboundCapacityMinor == null ? undefined : fromMinorUnits(totalOutboundCapacityMinor, 'CKB'),
     minOutboundCapacityMinor,
     minOutboundCapacity: minOutboundCapacityMinor == null ? undefined : fromMinorUnits(minOutboundCapacityMinor, 'CKB'),
+    maxOutboundCapacityMinor,
+    maxOutboundCapacity: maxOutboundCapacityMinor == null ? undefined : fromMinorUnits(maxOutboundCapacityMinor, 'CKB'),
     channels: channels.slice(0, 20)
   };
 }

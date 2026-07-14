@@ -33,10 +33,26 @@ type RecipientBridgeState = {
 
 const CHANNEL_OPEN_WAIT_MS = 10 * 60 * 1000;
 
-function sufficientOutboundLiquidity(input: { activeCount?: number; totalOutboundCapacityMinor?: number; amountMinor: number }): boolean {
-  if ((input.activeCount ?? 0) <= 0) return false;
-  if (input.totalOutboundCapacityMinor == null) return true;
-  return input.totalOutboundCapacityMinor >= input.amountMinor;
+type FiberReadinessForLiquidity = Awaited<ReturnType<typeof getFiberNodeReadiness>>;
+
+function payoutOutboundCapacityMinor(readiness: FiberReadinessForLiquidity): number | undefined {
+  const targetPubkey = env.FIBER_EXIT_KEYSEND_TARGET_PUBKEY.trim().toLowerCase();
+  const channels = readiness.channels.channels ?? [];
+  if (targetPubkey) {
+    const targetCapacities = channels
+      .filter((channel) => channel.peerId?.toLowerCase() === targetPubkey)
+      .map((channel) => channel.outboundCapacityMinor)
+      .filter((value): value is number => value != null);
+    return targetCapacities.length > 0 ? Math.max(...targetCapacities) : undefined;
+  }
+  return readiness.channels.maxOutboundCapacityMinor ?? readiness.channels.totalOutboundCapacityMinor;
+}
+
+function sufficientOutboundLiquidity(input: { readiness: FiberReadinessForLiquidity; amountMinor: number }): boolean {
+  if ((input.readiness.channels.activeCount ?? 0) <= 0) return false;
+  const outboundCapacityMinor = payoutOutboundCapacityMinor(input.readiness);
+  if (outboundCapacityMinor == null) return false;
+  return outboundCapacityMinor >= input.amountMinor;
 }
 
 async function recipientBridgeState(sessionId: string, recipientIndex: number): Promise<RecipientBridgeState> {
@@ -131,12 +147,8 @@ export async function ensureVaultFundedFiberLiquidity(input: FiberLiquidityBridg
     throw new ApiError(503, 'FIBER_NODE_UNREACHABLE', 'Fiber node is not reachable, so vault liquidity cannot be routed through Fiber yet.');
   }
 
-  if (sufficientOutboundLiquidity({
-    activeCount: readiness.channels.activeCount,
-    totalOutboundCapacityMinor: readiness.channels.totalOutboundCapacityMinor,
-    amountMinor: input.amountMinor
-  })) {
-    return { ready: true, outboundCapacityMinor: readiness.channels.totalOutboundCapacityMinor };
+  if (sufficientOutboundLiquidity({ readiness, amountMinor: input.amountMinor })) {
+    return { ready: true, outboundCapacityMinor: payoutOutboundCapacityMinor(readiness) };
   }
 
   const nodeFundingAddress = readiness.node?.fundingAddress;
@@ -178,12 +190,8 @@ export async function ensureVaultFundedFiberLiquidity(input: FiberLiquidityBridg
   }
 
   const afterBridgeReadiness = await getFiberNodeReadiness();
-  if (sufficientOutboundLiquidity({
-    activeCount: afterBridgeReadiness.channels.activeCount,
-    totalOutboundCapacityMinor: afterBridgeReadiness.channels.totalOutboundCapacityMinor,
-    amountMinor: input.amountMinor
-  })) {
-    return { ready: true, outboundCapacityMinor: afterBridgeReadiness.channels.totalOutboundCapacityMinor };
+  if (sufficientOutboundLiquidity({ readiness: afterBridgeReadiness, amountMinor: input.amountMinor })) {
+    return { ready: true, outboundCapacityMinor: payoutOutboundCapacityMinor(afterBridgeReadiness) };
   }
 
   if (state.fiberChannelOpenProofId && channelOpenStillFresh(state.fiberChannelOpenRequestedAt)) {
@@ -200,11 +208,12 @@ export async function ensureVaultFundedFiberLiquidity(input: FiberLiquidityBridg
   try {
     const channel = await openFiberTestChannel({
       amount: fromMinorUnits(input.amountMinor, input.currency),
-      actorWalletId: input.ownerWalletId
+      actorWalletId: input.ownerWalletId,
+      exactAmount: true
     });
     await setRecipientBridgeFields(input.sessionId, input.recipientIndex, {
       fiberChannelOpenProofId: channel.proofId,
-      fiberChannelOpenAmountMinor: input.amountMinor,
+      fiberChannelOpenAmountMinor: channel.amountMinor,
       fiberChannelOpenRequestedAt: new Date()
     });
     await writeAuditLog({
