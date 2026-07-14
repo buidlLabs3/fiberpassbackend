@@ -14,7 +14,7 @@ import { writeAuditLog } from './audit.service.js';
 import { requireEmailConfigured } from './email.service.js';
 import { fiberAdapter, hashFiberPaymentRequest } from './fiberAdapter.js';
 import { createFiberExitInvoice, executeFiberExitCkbSettlement } from './fiberExitGateway.service.js';
-import { ensureVaultFundedFiberLiquidity } from './fiberLiquidityBridge.service.js';
+import { ensureVaultFundedFiberLiquidity, getCurrentFiberPayoutLiquiditySnapshot } from './fiberLiquidityBridge.service.js';
 import { fiberProvider } from './fiberProvider.js';
 import { sendRecipientInviteEmail, sendRecipientPayoutReceiptEmail } from './recipientEmail.service.js';
 import { deriveVaultForWallet } from './vault.service.js';
@@ -1906,6 +1906,15 @@ function dueWalletAmountMinor(wallet: RecipientWalletDto, currency: string): num
   return fallbackMinorUnits(wallet.amountMinor, wallet.amount, currency);
 }
 
+function earlierRecipientHasInFlightLiquidity(wallets: RecipientWalletDto[], recipientIndex: number): boolean {
+  return wallets.slice(0, recipientIndex).some((wallet) => {
+    if (wallet.status === 'paid') return false;
+    if (wallet.status === 'processing') return true;
+    if (wallet.fiberLiquidityBridgeTxHash || wallet.fiberChannelOpenProofId) return true;
+    return PENDING_PAYOUT_FAILURE_CODES.includes(wallet.lastFailureCode as typeof PENDING_PAYOUT_FAILURE_CODES[number]);
+  });
+}
+
 function isRetryableVaultConfigFailure(code?: string): boolean {
   return !!code && (RETRYABLE_VAULT_CONFIG_FAILURE_CODES as readonly string[]).includes(code);
 }
@@ -2041,6 +2050,19 @@ async function latestScheduledPayoutAttempt(sessionId: string, recipientIndex: n
   }).sort({ createdAt: -1 }).lean<ChargeAttemptLike | null>();
 }
 
+async function succeededScheduledPayoutSummary(sessionId: string, recipientIndex: number): Promise<{ totalMinor: number; count: number }> {
+  const attempts = await ChargeAttemptModel.find({
+    sessionId,
+    status: 'succeeded',
+    'metadata.scheduledPayout': true,
+    'metadata.recipientIndex': recipientIndex
+  }).select('amountMinor amount currency').lean<ChargeAttemptLike[]>();
+  return {
+    totalMinor: attempts.reduce((total, attempt) => total + fallbackMinorUnits(attempt.amountMinor, attempt.amount, attempt.currency), 0),
+    count: attempts.length
+  };
+}
+
 async function setRecipientWalletFields(sessionId: string, recipientIndex: number, fields: Record<string, unknown>): Promise<void> {
   const setFields: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(fields)) {
@@ -2052,6 +2074,10 @@ async function setRecipientWalletFields(sessionId: string, recipientIndex: numbe
 
 function fiberExitChargeIdempotencyKey(sessionId: string, recipientIndex: number): string {
   return 'fiber-exit:' + sessionId + ':' + recipientIndex;
+}
+
+function fiberExitChargeChunkIdempotencyKey(sessionId: string, recipientIndex: number, chunkIndex: number): string {
+  return fiberExitChargeIdempotencyKey(sessionId, recipientIndex) + ':chunk:' + chunkIndex;
 }
 
 async function ensureFiberExitInvoiceForWallet(input: {
@@ -2102,31 +2128,49 @@ async function executeFiberExitPayout(input: {
   let chargeAttempt = await latestScheduledPayoutAttempt(input.session.publicId, input.index);
   let fiberPaymentProofId = input.wallet.fiberExitPaymentProofId ?? chargeAttempt?.proofId;
 
-  if (!fiberPaymentProofId) {
-    await chargeSession({
-      sessionId: input.session.publicId,
-      amount: fromMinorUnits(input.amountMinor, input.session.currency),
-      type: 'Scheduled payout via Fiber exit: ' + input.wallet.name,
-      appId: undefined,
-      appServiceAddress: input.session.serviceAddress,
-      paymentRequest: invoice,
-      idempotencyKey: fiberExitChargeIdempotencyKey(input.session.publicId, input.index),
-      metadata: {
-        scheduledPayout: true,
-        directVaultPayout: false,
-        payoutRail: 'fiber_exit',
-        recipientIndex: input.index,
-        recipientName: input.wallet.name,
-        recipientAddress,
-        ...(invoice ? { fiberInvoice: invoice, fiberExitInvoice: invoice, fiberAllowSelfPayment: true } : {}),
-        ...(keysendTargetPubkey ? { fiberKeysendTargetPubkey: keysendTargetPubkey } : {}),
-        fiberPaymentTimeoutSeconds: 45,
-        paymentReference: input.session.paymentReference,
-        paymentPurpose: input.session.paymentPurpose
+  const succeededFiber = await succeededScheduledPayoutSummary(input.session.publicId, input.index);
+  let remainingFiberMinor = Math.max(input.amountMinor - succeededFiber.totalMinor, 0);
+
+  if (remainingFiberMinor > 0) {
+    let chunkIndex = succeededFiber.count;
+    while (remainingFiberMinor > 0) {
+      const chunkMinor = keysendTargetPubkey
+        ? Math.min(remainingFiberMinor, (await getCurrentFiberPayoutLiquiditySnapshot()).maxOutboundCapacityMinor ?? 0)
+        : remainingFiberMinor;
+      if (chunkMinor <= 0) {
+        throw new ApiError(409, 'FIBER_CHANNEL_OPEN_PENDING', 'Fiber liquidity is still activating for this payout. The payout worker will retry automatically.');
       }
-    });
-    chargeAttempt = await latestScheduledPayoutAttempt(input.session.publicId, input.index);
-    fiberPaymentProofId = chargeAttempt?.proofId;
+
+      await chargeSession({
+        sessionId: input.session.publicId,
+        amount: fromMinorUnits(chunkMinor, input.session.currency),
+        type: 'Scheduled payout via Fiber exit: ' + input.wallet.name,
+        appId: undefined,
+        appServiceAddress: input.session.serviceAddress,
+        paymentRequest: invoice,
+        idempotencyKey: keysendTargetPubkey
+          ? fiberExitChargeChunkIdempotencyKey(input.session.publicId, input.index, chunkIndex)
+          : fiberExitChargeIdempotencyKey(input.session.publicId, input.index),
+        metadata: {
+          scheduledPayout: true,
+          directVaultPayout: false,
+          payoutRail: 'fiber_exit',
+          recipientIndex: input.index,
+          recipientName: input.wallet.name,
+          recipientAddress,
+          ...(invoice ? { fiberInvoice: invoice, fiberExitInvoice: invoice, fiberAllowSelfPayment: true } : {}),
+          ...(keysendTargetPubkey ? { fiberKeysendTargetPubkey: keysendTargetPubkey, fiberPaymentChunkIndex: chunkIndex, fiberPaymentTotalAmountMinor: input.amountMinor } : {}),
+          fiberPaymentTimeoutSeconds: 45,
+          paymentReference: input.session.paymentReference,
+          paymentPurpose: input.session.paymentPurpose
+        }
+      });
+      chargeAttempt = await latestScheduledPayoutAttempt(input.session.publicId, input.index);
+      fiberPaymentProofId = chargeAttempt?.proofId;
+      remainingFiberMinor -= chunkMinor;
+      chunkIndex += 1;
+    }
+
     await setRecipientWalletFields(input.session.publicId, input.index, {
       fiberExitPaymentProofId: fiberPaymentProofId,
       fiberExitPaymentAttemptId: chargeAttempt?.attemptId
@@ -2315,6 +2359,10 @@ export async function runDueSessionPayouts(input: DueSessionPayoutWorkerInput = 
     }
 
     for (const [index, wallet] of wallets.entries()) {
+      if (earlierRecipientHasInFlightLiquidity(wallets, index)) {
+        result.skipped += 1;
+        continue;
+      }
       if (!isPayoutRecipientProcessable(wallet)) continue;
       const claimed = await claimRecipientWalletForPayout({ sessionId: session.publicId, index, staleBefore, retryBefore });
       if (!claimed) {
@@ -2403,8 +2451,10 @@ export async function runDueSessionPayouts(input: DueSessionPayoutWorkerInput = 
         result.succeeded += 1;
       } catch (error) {
         const chargeAttempt = await latestScheduledPayoutAttempt(session.publicId, index);
-        await markRecipientWalletFailure({ sessionId: session.publicId, index, failure: failureFromError(error), chargeAttemptId: chargeAttempt?.attemptId });
+        const failure = failureFromError(error);
+        await markRecipientWalletFailure({ sessionId: session.publicId, index, failure, chargeAttemptId: chargeAttempt?.attemptId });
         result.failed += 1;
+        if (PENDING_PAYOUT_FAILURE_CODES.includes(failure.code as typeof PENDING_PAYOUT_FAILURE_CODES[number])) break;
       }
     }
 
