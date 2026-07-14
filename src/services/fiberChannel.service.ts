@@ -78,8 +78,9 @@ function isLocalPeer(peerId: string, readiness: Awaited<ReturnType<typeof getFib
 }
 
 function channelAmountMinor(amount?: number): number {
-  const value = amount ?? env.FIBER_TEST_CHANNEL_AMOUNT_CKB;
-  return toMinorUnits(String(value), 'CKB');
+  const requestedMinor = toMinorUnits(String(amount ?? env.FIBER_TEST_CHANNEL_AMOUNT_CKB), 'CKB');
+  const configuredMinimumMinor = toMinorUnits(String(env.FIBER_TEST_CHANNEL_AMOUNT_CKB), 'CKB');
+  return Math.max(requestedMinor, configuredMinimumMinor);
 }
 
 export async function getFiberChannelStrategy(): Promise<FiberChannelStrategyDto> {

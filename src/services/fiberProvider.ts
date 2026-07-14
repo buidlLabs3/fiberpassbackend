@@ -106,18 +106,18 @@ export class RpcFiberProvider implements FiberProvider {
     }
 
     const raw = await this.rpc('open_channel', [{
-      peer_id: channelPeerId,
-      funding_amount: input.amountMinor.toString(),
-      public: false,
+      pubkey: channelPeerId,
+      funding_amount: '0x' + BigInt(input.amountMinor).toString(16),
+      public: true,
       shutdown_script: typeof input.metadata?.shutdownScript === 'string' ? input.metadata.shutdownScript : undefined
     }]);
 
     return {
       provider: this.kind,
       network: this.network,
-      networkSessionId: String((raw as { channel_id?: unknown })?.channel_id ?? input.localSessionId),
+      networkSessionId: String((raw as { channel_id?: unknown; temporary_channel_id?: unknown })?.channel_id ?? (raw as { temporary_channel_id?: unknown })?.temporary_channel_id ?? input.localSessionId),
       status: 'pending',
-      proofId: String((raw as { tx_hash?: unknown })?.tx_hash ?? ''),
+      proofId: String((raw as { tx_hash?: unknown; temporary_channel_id?: unknown })?.tx_hash ?? (raw as { temporary_channel_id?: unknown })?.temporary_channel_id ?? ''),
       raw
     };
   }
