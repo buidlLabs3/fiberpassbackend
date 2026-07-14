@@ -43,6 +43,10 @@ function invoiceHash(invoice: string): string {
   return createHash('sha256').update(invoice).digest('hex');
 }
 
+function fiberHexQuantity(value: number): string {
+  return '0x' + BigInt(Math.trunc(value)).toString(16);
+}
+
 async function callFiberRpc(method: string, params: unknown[]): Promise<unknown> {
   const response = await fetch(env.FIBER_RPC_URL, {
     method: 'POST',
@@ -69,11 +73,11 @@ export async function createFiberExitInvoice(input: FiberExitInvoiceInput): Prom
   }
 
   const raw = await callFiberRpc('new_invoice', [{
-    amount: String(input.amountMinor),
+    amount: fiberHexQuantity(input.amountMinor),
     description: input.description.slice(0, 240),
     currency: fiberCurrency(input.currency),
     fallback_address: input.recipientAddress,
-    expiry: env.FIBER_EXIT_INVOICE_EXPIRY_SECONDS,
+    expiry: fiberHexQuantity(env.FIBER_EXIT_INVOICE_EXPIRY_SECONDS),
     allow_mpp: true
   }]);
   const record = raw && typeof raw === 'object' ? raw as RpcInvoiceResult : {};
