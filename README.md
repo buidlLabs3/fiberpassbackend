@@ -2,6 +2,10 @@
 
 Node.js + TypeScript API for prepaid, revocable Fiber payment sessions.
 
+## System Design
+
+See [docs/system-design.md](docs/system-design.md) for the full FiberPass architecture, user flow, developer flow, vault-to-Fiber liquidity design, and payment execution diagram.
+
 ## Stack
 
 - Express API
