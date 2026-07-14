@@ -226,12 +226,11 @@ export async function ensureVaultFundedFiberLiquidity(input: FiberLiquidityBridg
   }
 
   try {
-    const stalePartialChannel = Boolean(
+    const staleExistingChannel = Boolean(
       state.fiberChannelOpenProofId &&
-      !channelOpenStillFresh(state.fiberChannelOpenRequestedAt) &&
-      (state.fiberChannelOpenAmountMinor ?? 0) < input.amountMinor
+      !channelOpenStillFresh(state.fiberChannelOpenRequestedAt)
     );
-    const missingLiquidityMinor = !state.fiberChannelOpenProofId || stalePartialChannel
+    const missingLiquidityMinor = !state.fiberChannelOpenProofId || staleExistingChannel
       ? input.amountMinor
       : Math.max(input.amountMinor - (afterBridgeLiquidity.totalOutboundCapacityMinor ?? 0), 1);
     const channel = await openFiberTestChannel({
